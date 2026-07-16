@@ -1,0 +1,442 @@
+#!/bin/bash
+{#
+  src/prime_rl/templates/multi_node_rl.sbatch.j2 のコンテナ (pyxis/enroot) 対応版。
+  rl.toml の [slurm].template_path でこのファイルを指すと、`rl` ランチャーが
+  config 分割・変数計算をした上でこのテンプレートを render する。
+
+  オリジナルとの差分:
+    - 各ノードの実行を pyxis コンテナ (prime-rl-v0.7.0-disagg.sqsh) 内で行う
+    - host 側の uv sync / .venv activate を削除 (依存は image に焼き込み済み)
+    - `uv run <cmd>` -> venv の console script 直接実行 (/app/.venv/bin が PATH)
+    - repo の src/packages/deps を /app に overlay mount し、image を rebuild
+      せずに現在の checkout のコードで実行する (/app/.venv の editable install が
+      /app/src 等を指しているため)
+    - IB 検出を ibv_devinfo (image に無い) から sysfs ベースに変更
+    - disagg 用 UCX パスを third_party/ucx から image 同梱の /opt/ucx に変更
+    - cluster 固有ディレクティブ (qos/chdir/signal/comment) を追加
+    - compute node からは repo が /lustre/... で見えるため、login node で
+      /scratch/... に resolve されたパスを /lustre/... に置換する
+#}
+#SBATCH --job-name={{ job_name }}
+#SBATCH --nodes={{ num_train_nodes + num_infer_nodes }}
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:{{ gpus_per_node }}
+#SBATCH --partition={{ partition }}
+{%- if account %}
+#SBATCH --account={{ account }}
+{%- endif %}
+{%- if time %}
+#SBATCH --time={{ time }}
+{%- endif %}
+{%- if nodelist %}
+#SBATCH --nodelist={{ nodelist }}
+{%- endif %}
+{%- if exclude %}
+#SBATCH --exclude={{ exclude }}
+{%- endif %}
+#SBATCH --exclusive
+#SBATCH --output={{ output_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}/job_%j.log
+#SBATCH --error={{ output_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}/job_%j.log
+# --- cluster 固有の必須ディレクティブ ---
+# qos=short: 2h 以内の batch job に必要
+#SBATCH --qos=short
+# compute node 側の mount 位置 (/lustre/...) を作業ディレクトリに指定
+#SBATCH --chdir={{ project_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}
+# teardown 用に batch script へ TERM を wall-time 120s 前に送る
+#SBATCH --signal=B:TERM@120
+# GPU idle reaper 対策: rollout (LLM decode) 中は DCGM SM_ACTIVE が低く idle 扱いされるため exempt を申請
+#SBATCH --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"120","reason":"benchmarking","description":"RL workload benchmark (2h wall time): rollout (LLM decode) phases run small-batch MoE decode with near-zero DCGM SM_ACTIVE for most of the job; observed ~35 min low-SM window per training step"}}'
+
+# Exit immediately on any failed command so a crash anywhere releases the
+# allocation instead of leaving zombie processes holding nodes.
+set -e
+
+# Configs
+export NUM_TRAIN_NODES={{ num_train_nodes }}
+export NUM_INFER_NODES={{ num_infer_nodes }}
+export NODES_PER_INFER_REPLICA={{ nodes_per_infer_replica }}
+export NUM_INFER_REPLICAS={{ num_infer_replicas }}
+export GPUS_PER_NODE={{ gpus_per_node }}
+{% if num_infer_nodes > 0 -%}
+export ROUTER_PORT={{ router.port }}
+export INFERENCE_TP={{ inference_tp }}
+export INFERENCE_DP_LOCAL=$((GPUS_PER_NODE / INFERENCE_TP))
+export INFERENCE_DATA_PARALLEL_RPC_PORT={{ inference_data_parallel_rpc_port }}
+{% if is_disaggregated -%}
+export NUM_PREFILL_NODES={{ num_prefill_nodes }}
+export NUM_DECODE_NODES={{ num_decode_nodes }}
+export NUM_PREFILL_REPLICAS={{ num_prefill_replicas }}
+export NUM_DECODE_REPLICAS={{ num_decode_replicas }}
+export NODES_PER_PREFILL_REPLICA={{ prefill_nodes_per_replica }}
+export NODES_PER_DECODE_REPLICA={{ decode_nodes_per_replica }}
+export PREFILL_PORT={{ prefill_port }}
+export DECODE_PORT={{ decode_port }}
+{%- if router.type == "llm-d" %}
+export DECODE_SIDECAR_PORT={{ router.decode_sidecar_port }}
+{%- endif %}
+{%- else -%}
+export BACKEND_PORT={{ backend_port }}
+export INFERENCE_ENABLE_EXPERT_PARALLEL={{ "1" if inference_enable_expert_parallel else "0" }}
+{%- endif %}
+{%- endif %}
+
+# Paths (compute node では /scratch mount が無いため /lustre 側のパスを使う)
+export PROJECT_DIR={{ project_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}
+export CONFIG_DIR={{ config_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}
+export OUTPUT_DIR={{ output_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}
+export ORCHESTRATOR_OUTPUT_DIR={{ orchestrator_output_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}
+mkdir -p $OUTPUT_DIR/logs/trainer $OUTPUT_DIR/logs/inference
+rm -f $OUTPUT_DIR/logs/inference/*.log
+ln -sfn trainer/node_0.log $OUTPUT_DIR/logs/trainer.log
+ln -sfn inference/node_0.log $OUTPUT_DIR/logs/inference.log
+
+# Container (pyxis/enroot)
+# PRIME_RL_SQSH で差し替え可能 (sbatch はデフォルトで submit 時の環境を export するため、
+# `PRIME_RL_SQSH=... bash experiments/training/submit.sh ...` で新イメージを試せる)
+export SQSH="${PRIME_RL_SQSH:-/lustre/fsw/portfolios/coreai/users/kfujii/containers/prime-rl-v0.7.0-cu13-disagg-v3.sqsh}"
+# FlashInfer の JIT キャッシュ (/root/.cache/flashinfer) はコンテナ内だと
+# ジョブごとに消え、毎回 compute_103a 向けカーネルの再コンパイル (10 分超) を
+# 払うことになるため、lustre 上の永続ディレクトリをマウントする。
+FLASHINFER_CACHE=/lustre/fsw/portfolios/coreai/users/kfujii/cache/flashinfer
+mkdir -p "$FLASHINFER_CACHE"
+export CONTAINER_MOUNTS="/lustre/fsw/portfolios/coreai/users/kfujii:/lustre/fsw/portfolios/coreai/users/kfujii,${PROJECT_DIR}:${PROJECT_DIR},${PROJECT_DIR}/src:/app/src,${PROJECT_DIR}/packages:/app/packages,${PROJECT_DIR}/deps:/app/deps,${FLASHINFER_CACHE}:/root/.cache/flashinfer"
+
+export WANDB_SHARED_MODE=1
+export WANDB_SHARED_RUN_ID=${WANDB_SHARED_RUN_ID:-$(python3 -c "import uuid; print(uuid.uuid4().hex)")}
+
+# Networking
+HOSTNAMES=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
+TRAIN_HOSTS=( ${HOSTNAMES[@]:$NUM_INFER_NODES:$SLURM_JOB_NUM_NODES} )
+export HOSTNAMES_STR="${HOSTNAMES[*]}"
+
+{% if num_infer_nodes > 0 -%}
+INFER_HOSTS=( ${HOSTNAMES[@]:0:$NUM_INFER_NODES} )
+
+# Build per-replica router URLs, admin URLs, and backend args for the router
+INFER_URLS=""
+ADMIN_URLS=""
+ALL_ROUTER_ARGS=""
+{% if is_disaggregated -%}
+for ((r=0; r<NUM_INFER_REPLICAS; r++)); do
+    replica_base=$((r * NODES_PER_INFER_REPLICA))
+    router_host="${INFER_HOSTS[$replica_base]}"
+    INFER_URLS="${INFER_URLS:+$INFER_URLS }http://${router_host}:${ROUTER_PORT}/v1"
+
+    REPLICA_ROUTER_ARGS=""
+    # External-LB: one prefill/decode endpoint per DP rank (PORT + k) on each node.
+    for ((p=0; p<NUM_PREFILL_NODES; p++)); do
+        node_idx=$((replica_base + p))
+        host="${INFER_HOSTS[$node_idx]}"
+        for ((k=0; k<INFERENCE_DP_LOCAL; k++)); do
+            ADMIN_URLS="${ADMIN_URLS:+$ADMIN_URLS }http://${host}:$((PREFILL_PORT + k))/v1"
+            REPLICA_ROUTER_ARGS="$REPLICA_ROUTER_ARGS --prefill http://${host}:$((PREFILL_PORT + k))"
+        done
+    done
+    for ((d=0; d<NUM_DECODE_NODES; d++)); do
+        node_idx=$((replica_base + NUM_PREFILL_NODES + d))
+        host="${INFER_HOSTS[$node_idx]}"
+        for ((k=0; k<INFERENCE_DP_LOCAL; k++)); do
+            ADMIN_URLS="${ADMIN_URLS:+$ADMIN_URLS }http://${host}:$((DECODE_PORT + k))/v1"
+            REPLICA_ROUTER_ARGS="$REPLICA_ROUTER_ARGS --decode http://${host}:$((DECODE_PORT + k))"
+        done
+    done
+    ALL_ROUTER_ARGS="${ALL_ROUTER_ARGS:+$ALL_ROUTER_ARGS|}$REPLICA_ROUTER_ARGS"
+done
+{%- else -%}
+for ((r=0; r<NUM_INFER_REPLICAS; r++)); do
+    head_idx=$((r * NODES_PER_INFER_REPLICA))
+    router_host="${INFER_HOSTS[$head_idx]}"
+    INFER_URLS="${INFER_URLS:+$INFER_URLS }http://${router_host}:${ROUTER_PORT}/v1"
+
+    REPLICA_ROUTER_ARGS=""
+    for ((n=0; n<NODES_PER_INFER_REPLICA; n++)); do
+        node_idx=$((head_idx + n))
+        host="${INFER_HOSTS[$node_idx]}"
+        # External-LB: one endpoint per DP rank (BACKEND_PORT + dp_local) on each node.
+        for ((k=0; k<INFERENCE_DP_LOCAL; k++)); do
+            ADMIN_URLS="${ADMIN_URLS:+$ADMIN_URLS }http://${host}:$((BACKEND_PORT + k))/v1"
+            REPLICA_ROUTER_ARGS="$REPLICA_ROUTER_ARGS http://${host}:$((BACKEND_PORT + k))"
+        done
+    done
+    ALL_ROUTER_ARGS="${ALL_ROUTER_ARGS:+$ALL_ROUTER_ARGS|}$REPLICA_ROUTER_ARGS"
+done
+{%- endif %}
+export INFER_URLS
+export ADMIN_URLS
+export ALL_ROUTER_ARGS
+echo "INFER_HOSTS=${INFER_HOSTS[*]}"
+echo "INFER_URLS=${INFER_URLS}"
+echo "ADMIN_URLS=${ADMIN_URLS}"
+{%- endif %}
+
+echo "HOSTNAMES=${HOSTNAMES[*]}"
+echo "TRAIN_HOSTS=${TRAIN_HOSTS[*]}"
+
+export MASTER_ADDR="${HOSTNAMES[$NUM_INFER_NODES]}"
+export MASTER_PORT=29500
+echo "MASTER_ADDR=${MASTER_ADDR}"
+echo "MASTER_PORT=${MASTER_PORT}"
+
+# Setup environment (host 側)
+# コンテナ運用のため uv sync / venv activate はしない。.env は `set -a` で export し、
+# srun -> pyxis 経由でコンテナ内のプロセスにも伝播させる。
+cd $PROJECT_DIR
+set -a
+[ -f .env ] && source .env
+set +a
+
+{% if pre_run_command %}
+# Pre-run command
+{{ pre_run_command }}
+{% endif %}
+
+# Cleanup stale node-local state from prior jobs. Orphan python/torchrun/vllm
+# processes and vLLM/torch IPC files under /dev/shm and /tmp can survive SLURM
+# termination and cause the next launch to hang. Harmless on clean nodes.
+# (host 側で実行 — コンテナ不要)
+srun bash -s <<'CLEANUP_SH'
+    pkill -9 -f "[p]ython.*prime_rl" 2>/dev/null
+    pkill -9 -f "[t]orchrun" 2>/dev/null
+    pkill -9 -f "[v]llm-router" 2>/dev/null
+    pkill -9 -f "[v]llm" 2>/dev/null
+    pkill -9 -f "[p]rime_rl" 2>/dev/null
+    pkill -9 "vllm" 2>/dev/null
+    pkill -9 "vllm::.*" 2>/dev/null
+    sleep 2
+    rm -rf /dev/shm/vllm-* /dev/shm/vllm_* /tmp/vllm-* /tmp/vllm_* /tmp/torch-* /tmp/torchelastic_* 2>/dev/null
+    procs=$(ps -eo comm,args | grep -E "python|torchrun|vllm|vllm::" | grep -v grep | wc -l)
+    gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk "{s+=\$1} END {print s}")
+    echo "[node-cleanup] $(hostname) procs=$procs gpu_mem=${gpu}MiB"
+CLEANUP_SH
+
+# Run RL (各タスク = 1 ノード = 1 pyxis コンテナ)
+# --kill-on-bad-exit=1 propagates a non-zero exit on any node to all other
+# tasks so a crashed component terminates the SLURM job instead of leaving the
+# surviving ranks holding nodes.
+srun --kill-on-bad-exit=1 \
+    --container-image="$SQSH" \
+    --container-mounts="$CONTAINER_MOUNTS" \
+    bash -c '
+    # pipefail ensures `cmd | tee log` propagates `cmd` failures, and the
+    # wait/cleanup block at the end of this script surfaces background
+    # process crashes (router, orchestrator) as task failures.
+    set -o pipefail
+
+    # Source environment (コンテナ内: venv は /app/.venv 固定)
+    cd $PROJECT_DIR
+    set -a
+    [ -f .env ] && source .env
+    set +a
+    export VIRTUAL_ENV=/app/.venv
+    export PATH=/app/.venv/bin:$PATH
+
+    # Higher ulimit
+    ulimit -n 65536
+
+    # ノード間 NCCL の設定。この cluster は AWS 上にあり、ノード間 RDMA は
+    # EFA (rdmap* × 16, driver=efa)。EFA を NCCL から使うには aws-ofi-nccl
+    # プラグイン (libnccl-net.so) が必要。プラグイン無しだと NCCL は
+    # link_layer=InfiniBand に見える ibp198s0f0/ibp199s0f0 (別系統でノード間
+    # 疎通なし) を IB transport で選び、IBV_WC_RETRY_EXC_ERR / async fatal
+    # event で hang する (pool0-0129/0125/0229/0282/0430 の全組み合わせで再現)。
+    #
+    # image に aws-ofi-nccl があれば LD_LIBRARY_PATH 経由で NCCL に自動ロード
+    # させて EFA を使う (AWS 公式手順どおり FI_PROVIDER は設定しない。成功時は
+    # NCCL_DEBUG=INFO で "NET/OFI Selected Provider is efa" が出る)。
+    # 無い旧 image では IB transport を無効化して TCP ソケットにフォールバック。
+    if [ -d /opt/amazon/ofi-nccl/lib ]; then
+        export LD_LIBRARY_PATH=/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH:-}
+        # EFA installer 1.49 が入れる plugin は libnccl-net-ofi.so (デフォルトの
+        # 探索名 libnccl-net.so と異なる)。suffix を明示しないとロードされず
+        # IB transport に落ちて hang が再発する。
+        export NCCL_NET_PLUGIN=ofi
+        export NCCL_TUNER_PLUGIN=ofi
+    else
+        export NCCL_IB_DISABLE=1
+    fi
+
+{% if num_infer_nodes > 0 -%}
+
+if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
+    INFER_NODE_RANK=$SLURM_PROCID
+    # Inference env vars: launcher defaults + [env_vars] + [inference.env_vars]
+{%- for key, value in inference_env_vars.items() %}
+    export {{ key }}="{{ value }}"
+{%- endfor %}
+    LOCAL_IP=$(hostname -I | awk "{print \$1}")
+
+{%- if kv_offload %}
+    ulimit -l unlimited
+{%- endif %}
+
+    REPLICA_IDX=$((INFER_NODE_RANK / NODES_PER_INFER_REPLICA))
+    RANK_IN_REPLICA=$((INFER_NODE_RANK % NODES_PER_INFER_REPLICA))
+
+    echo "INFER_NODE_RANK=$INFER_NODE_RANK REPLICA=$REPLICA_IDX RANK_IN_REPLICA=$RANK_IN_REPLICA LOCAL_IP=$LOCAL_IP" \
+        | tee $OUTPUT_DIR/logs/inference/node_${INFER_NODE_RANK}.log
+
+    CONFIG_PATH="$CONFIG_DIR/inference.toml"
+{% include '_launch_rank.sh.j2' %}
+{% include '_launch_router.sh.j2' %}
+
+{% if is_disaggregated -%}
+    # PD disaggregated: NIXL KV transfer + role-based inference
+    read -ra HOSTNAMES <<< "$HOSTNAMES_STR"
+
+    # Bind gloo to the interface that owns LOCAL_IP (the rendezvous IP).
+    GLOO_IFNAME=$(ip -o -4 addr show to "$LOCAL_IP" 2>/dev/null | awk "{print \$2; exit}")
+    if [ -n "$GLOO_IFNAME" ]; then export GLOO_SOCKET_IFNAME=$GLOO_IFNAME; fi
+    # UCX/NIXL の KV transfer は TCP (ENA, LOCAL_IP を持つ IF) に固定する。
+    # この cluster に RDMA の自動選択は使えない:
+    #   - mlx5 デバイスは存在しない (EFA cluster)
+    #   - link_layer=InfiniBand に見える ibp19{8,9}s0f0 はノード間疎通の無い別系統
+    #     (選ぶと転送時に hang。NCCL と同じ罠, job 173854)
+    #   - EFA (rdmap*) は UCX の verbs 経路では未検証。EFA ネイティブ化は
+    #     NIXL libfabric backend の検証後に行う
+    export UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc
+    export UCX_NET_DEVICES=${GLOO_IFNAME:-all}
+    # image 同梱の UCX 1.19 (nixl はこれに対して build 済み)
+    export LD_LIBRARY_PATH="/opt/ucx/lib:/opt/ucx/lib/ucx:${LD_LIBRARY_PATH:-}"
+    export VLLM_NIXL_SIDE_CHANNEL_HOST=$LOCAL_IP
+    export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
+
+    DECODE_COMPILE_CFG='"'"'{"cudagraph_mode":"FULL_DECODE_ONLY"}'"'"'
+
+    REPLICA_BASE=$((REPLICA_IDX * NODES_PER_INFER_REPLICA))
+
+    if [ "$RANK_IN_REPLICA" -lt "$NUM_PREFILL_NODES" ]; then
+        ROLE="prefill"
+        SUB_REPLICA=$((RANK_IN_REPLICA / NODES_PER_PREFILL_REPLICA))
+        ROLE_RANK=$((RANK_IN_REPLICA % NODES_PER_PREFILL_REPLICA))
+        DP=$((NODES_PER_PREFILL_REPLICA * INFERENCE_DP_LOCAL))
+        PORT=$PREFILL_PORT
+        START_RANK=$((ROLE_RANK * INFERENCE_DP_LOCAL))
+        HEAD_HOST="${HOSTNAMES[$((REPLICA_BASE + SUB_REPLICA * NODES_PER_PREFILL_REPLICA))]}"
+{% for key, value in prefill_env_vars.items() %}
+        export {{ key }}="{{ value }}"
+{% endfor %}
+        ROLE_EXTRA="\"all2all_backend\": \"deepep_high_throughput\"{{ prefill_vllm_extra_json }}"
+    else
+        ROLE="decode"
+        RANK_IN_DECODE=$((RANK_IN_REPLICA - NUM_PREFILL_NODES))
+        SUB_REPLICA=$((RANK_IN_DECODE / NODES_PER_DECODE_REPLICA))
+        ROLE_RANK=$((RANK_IN_DECODE % NODES_PER_DECODE_REPLICA))
+        DP=$((NODES_PER_DECODE_REPLICA * INFERENCE_DP_LOCAL))
+        PORT=$DECODE_PORT
+        START_RANK=$((ROLE_RANK * INFERENCE_DP_LOCAL))
+        HEAD_HOST="${HOSTNAMES[$((REPLICA_BASE + NUM_PREFILL_NODES + SUB_REPLICA * NODES_PER_DECODE_REPLICA))]}"
+{% for key, value in decode_env_vars.items() %}
+        export {{ key }}="{{ value }}"
+{% endfor %}
+        ROLE_EXTRA="\"all2all_backend\": \"deepep_low_latency\", \"compilation_config\": $DECODE_COMPILE_CFG{{ decode_vllm_extra_json }}"
+    fi
+
+    echo "ROLE=$ROLE REPLICA=$REPLICA_IDX SUB_REPLICA=$SUB_REPLICA ROLE_RANK=$ROLE_RANK DP=$DP PORT=$PORT" \
+        | tee -a $OUTPUT_DIR/logs/inference/node_${INFER_NODE_RANK}.log
+
+    # Start the router on the first node of each replica (PD mode, external LB across per-rank endpoints)
+    if [ "$RANK_IN_REPLICA" -eq 0 ]; then
+        REPLICA_ROUTER_ARGS=$(echo "$ALL_ROUTER_ARGS" | cut -d"|" -f$((REPLICA_IDX + 1)))
+        launch_router pd "$REPLICA_ROUTER_ARGS" "$ROUTER_PORT" "{{ router.policy }}" "$OUTPUT_DIR/logs/inference/router_${REPLICA_IDX}.log" "$REPLICA_IDX" "$REPLICA_BASE"
+    fi
+
+    # External-LB: one vLLM API server per local DP rank (PORT + k).
+    if [ "$ROLE_RANK" -eq 0 ]; then DP_ADDR=$LOCAL_IP; else DP_ADDR=$HEAD_HOST; fi
+    for k in $(seq 0 $((INFERENCE_DP_LOCAL - 1))); do
+        GLOBAL_RANK=$((START_RANK + k))
+        RANK_GPUS=$(seq -s, $((k * INFERENCE_TP)) $((k * INFERENCE_TP + INFERENCE_TP - 1)))
+        RANK_EXTRA="{\"data_parallel_address\": \"$DP_ADDR\", \"data_parallel_rank\": $GLOBAL_RANK, $ROLE_EXTRA}"
+        launch_inference_rank "$((PORT + k))" "$RANK_GPUS" "$DP" "$INFERENCE_DATA_PARALLEL_RPC_PORT" "$RANK_EXTRA" "$((5600 + k))" "$(rank_log "$INFER_NODE_RANK" "$k")"
+    done
+{%- else -%}
+    # Start the router on the first node of each replica
+    if [ "$RANK_IN_REPLICA" -eq 0 ]; then
+        REPLICA_ROUTER_ARGS=$(echo "$ALL_ROUTER_ARGS" | cut -d"|" -f$((REPLICA_IDX + 1)))
+        launch_router regular "$REPLICA_ROUTER_ARGS" "$ROUTER_PORT" "{{ router.policy }}" "$OUTPUT_DIR/logs/inference/router_${REPLICA_IDX}.log" "$REPLICA_IDX" "$((REPLICA_IDX * NODES_PER_INFER_REPLICA))" "$NODES_PER_INFER_REPLICA"
+    fi
+
+    # External-LB: one vLLM API server per DP rank on this node (BACKEND_PORT + d).
+    read -ra HOSTNAMES <<< "$HOSTNAMES_STR"
+    REPLICA_HEAD_HOST="${HOSTNAMES[$((REPLICA_IDX * NODES_PER_INFER_REPLICA))]}"
+    INFER_GROUP_DP=$((NODES_PER_INFER_REPLICA * INFERENCE_DP_LOCAL))
+    if [ "$RANK_IN_REPLICA" -eq 0 ]; then DP_ADDR="$LOCAL_IP"; else DP_ADDR="$REPLICA_HEAD_HOST"; fi
+    for ((d=0; d<INFERENCE_DP_LOCAL; d++)); do
+        RANK_GPUS=$(seq -s, $((d * INFERENCE_TP)) $((d * INFERENCE_TP + INFERENCE_TP - 1)))
+        RANK_LOG=$(rank_log "$INFER_NODE_RANK" "$d")
+        if [ "$INFERENCE_ENABLE_EXPERT_PARALLEL" -eq 1 ]; then
+            GLOBAL_DP_RANK=$((RANK_IN_REPLICA * INFERENCE_DP_LOCAL + d))
+            RANK_EXTRA="{\"data_parallel_rank\": $GLOBAL_DP_RANK, \"data_parallel_address\": \"$DP_ADDR\"}"
+            launch_inference_rank "$((BACKEND_PORT + d))" "$RANK_GPUS" "$INFER_GROUP_DP" "$INFERENCE_DATA_PARALLEL_RPC_PORT" "$RANK_EXTRA" "" "$RANK_LOG"
+        else
+            # Dense: independent single-engine servers (no DP linkage).
+            launch_inference_rank "$((BACKEND_PORT + d))" "$RANK_GPUS" 1 "" "" "" "$RANK_LOG"
+        fi
+    done
+{%- endif %}
+
+else
+    TRAIN_NODE_RANK=$((SLURM_PROCID - NUM_INFER_NODES))
+{%- else %}
+    TRAIN_NODE_RANK=$SLURM_PROCID
+{%- endif %}
+
+    # Trainer env vars: launcher defaults + [env_vars] + [trainer.env_vars]
+{%- for key, value in trainer_env_vars.items() %}
+    export {{ key }}="{{ value }}"
+{%- endfor %}
+
+    echo $HOSTNAMES_STR | tee $OUTPUT_DIR/logs/trainer/node_${TRAIN_NODE_RANK}.log
+
+    WANDB_SHARED_LABEL=trainer torchrun \
+        --role=trainer \
+        --nnodes=$NUM_TRAIN_NODES \
+        --nproc-per-node=$GPUS_PER_NODE \
+        --node-rank=$TRAIN_NODE_RANK \
+        --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT \
+        --rdzv-id=job_$SLURM_JOB_ID \
+        --log-dir=$OUTPUT_DIR/logs/trainer/torchrun \
+        --tee=3 \
+        --redirects=3 \
+        --local-ranks-filter={{ ranks_filter }} \
+        -m prime_rl.trainer.rl.train \
+        @ $CONFIG_DIR/trainer.toml \
+        2>&1 | sed -u 's/^\[[a-zA-Z]*[0-9]*\]://' | tee -a $OUTPUT_DIR/logs/trainer/node_${TRAIN_NODE_RANK}.log | sed -u "s/\x1b\[[0-9;]*m//g;s/^/[trainer:node$TRAIN_NODE_RANK] /" &
+{% if num_infer_nodes > 0 %}    fi{% endif %}
+{% if num_infer_nodes > 0 %}
+# Launch the orchestrator on one node. Default is trainer rank 0 (SLURM_PROCID ==
+# NUM_INFER_NODES). With orchestrator_on_inference it moves to the last inference node.
+{% if orchestrator_on_inference %}ORCH_PROCID=$((NUM_INFER_NODES - 1)){% else %}ORCH_PROCID=$NUM_INFER_NODES{% endif %}
+if [ "$SLURM_PROCID" -eq "$ORCH_PROCID" ]; then
+    ORCHESTRATOR_ARGS="@ $CONFIG_DIR/orchestrator.toml"
+    ORCHESTRATOR_ARGS="$ORCHESTRATOR_ARGS --model.client.base-url $INFER_URLS"
+    ORCHESTRATOR_ARGS="$ORCHESTRATOR_ARGS --model.client.admin-base-url $ADMIN_URLS"
+{%- if orchestrator_env_vars %}
+    # Orchestrator env vars from [env_vars] + [orchestrator.env_vars]
+{%- for key, value in orchestrator_env_vars.items() %}
+    export {{ key }}="{{ value }}"
+{%- endfor %}
+{%- endif %}
+    {% if use_nccl_broadcast %}ORCHESTRATOR_ARGS="$ORCHESTRATOR_ARGS --weight_broadcast.host $MASTER_ADDR"
+    {% endif %}WANDB_SHARED_LABEL=orchestrator orchestrator $ORCHESTRATOR_ARGS \
+        2>&1 | tee $OUTPUT_DIR/logs/orchestrator.log | sed -u "s/\x1b\[[0-9;]*m//g;s/^/[orch] /" &
+fi
+{% endif %}
+
+# Wait for the first background job to exit and propagate its exit code.
+wait -n
+EXIT_CODE=$?
+REMAINING_PIDS=$(jobs -p)
+{%- if cleanup_grace_period %}
+# On a non-zero exit stay alive for the grace period so in-flight trainer
+# checkpoints can flush before --kill-on-bad-exit reaps peer tasks.
+if [ "$EXIT_CODE" -ne 0 ]; then
+    echo "[$(hostname)] component exited with code $EXIT_CODE - waiting up to {{ cleanup_grace_period }}s for in-flight checkpoints to flush before teardown"
+    sleep {{ cleanup_grace_period }}
+fi
+{%- endif %}
+echo "[$(hostname)] tearing down (exit code $EXIT_CODE) - terminating remaining processes"
+for pid in $REMAINING_PIDS; do
+    kill -TERM $pid 2>/dev/null || true
+done
+exit $EXIT_CODE
+'

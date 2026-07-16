@@ -1,0 +1,23 @@
+{# src/prime_rl/templates/_launch_router.sh.j2 のコンテナ対応版。
+   vllm-router のみサポート (llm-d は third_party バイナリが必要なため未対応)。
+   vllm-router は image の /app/.venv/bin にインストール済み。 #}
+# launch_router <mode:pd|regular> <worker_args> <port> <policy> <log> <replica_idx> <node_base> [node_count]
+launch_router() {
+    local mode="$1" worker_args="$2" port="$3" policy="$4" log="$5" replica="${6:-0}" node_base="${7:-0}" node_count="${8:-0}"
+{%- if router.type == "llm-d" %}
+    echo "ERROR: llm-d router is not supported by the container template" | tee "$log"
+    exit 1
+{%- else %}
+    local tag="vllm-router"; [ "$mode" = pd ] && tag="vllm-router (PD)"
+    echo "Starting $tag on $LOCAL_IP:$port${replica:+ for replica $replica}" | tee "$log"
+    local -a cmd=(vllm-router --policy "$policy" --host 0.0.0.0 --port "$port"
+        --request-id-headers x-session-id
+        --worker-startup-timeout-secs 4200 --log-level debug)
+    if [ "$mode" = pd ]; then
+        cmd+=(--vllm-pd-disaggregation $worker_args)
+    else
+        cmd+=(--worker-urls $worker_args)
+    fi
+    "${cmd[@]}" >> "$log" 2>&1 &
+{%- endif %}
+}

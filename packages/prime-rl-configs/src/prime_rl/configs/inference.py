@@ -401,6 +401,9 @@ class InferenceConfig(BaseConfig):
     use_pd_kv_transfer: bool = False
     """Auto-set for disaggregated P/D: emit the NIXL transfer connector. Persisted into the per-node config (which drops ``deployment``) so the connector is still built per worker. Not meant to be set by hand."""
 
+    nixl_backends: list[str] = ["UCX"]
+    """NIXL backends for the P/D KV transfer connector, in priority order (vLLM ``kv_connector_extra_config["backends"]``). ``["UCX"]`` is the vLLM default; use ``["LIBFABRIC"]`` for EFA-native RDMA on AWS clusters (requires a NIXL build with the libfabric plugin)."""
+
     enable_return_routed_experts: bool = False
     """Return routed experts in responses. Forwarded as ``--enable-return-routed-experts``."""
 
@@ -533,7 +536,7 @@ class InferenceConfig(BaseConfig):
                 {
                     "kv_connector": "NixlConnector",
                     "kv_role": "kv_both",
-                    "kv_connector_extra_config": {"num_threads": 1},
+                    "kv_connector_extra_config": {"num_threads": 1, "backends": self.nixl_backends},
                 }
             )
         if self.kv_cache_offload is not None:

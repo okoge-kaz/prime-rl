@@ -1,0 +1,101 @@
+# math_qwen30b/rl.toml の PD (prefill/decode) disaggregation 版。
+# 学習ハイパラはそちらと同一に保ち、inference 側だけ
+# prefill 1 ノード + decode 1 ノードの disaggregated 構成に変える
+# (比較実験のため)。合計ノード数は 3 (train 1 + prefill 1 + decode 1)。
+#
+# 前提: cu13-disagg イメージ (NIXL + /opt/ucx + deep-ep/deep-gemm 入り)。
+# テンプレート側 (multi_node_rl_container.sbatch.j2) が is_disaggregated を
+# 見て vllm-router に --prefill/--decode エンドポイントを渡す。
+# KV 転送は NIXL (UCX 1.19 ソースビルド、#2883 対策済み) 経由。
+
+max_steps = 100
+seq_len = 16384
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3-30B-A3B"
+
+[weight_broadcast]
+type = "nccl"
+
+[deployment]
+type = "multi_node"
+num_train_nodes = 1
+# num_infer_nodes は inference.deployment (prefill 1 + decode 1 = 2) から自動導出
+
+[inference.deployment]
+type = "disaggregated"
+prefill_nodes_per_replica = 1
+decode_nodes_per_replica = 1
+num_prefill_replicas = 1
+num_decode_replicas = 1
+
+[slurm]
+job_name = "math-qwen30b-disagg"
+partition = "batch"
+account = "coreai_horizon_dilations"
+time = "2:00:00"
+# コンポーネントがクラッシュした際に teardown 前に待つ秒数 (デフォルト 3600)。
+# 長いと failed job がノードを確保し続けるので短縮。0 で即 teardown。
+cleanup_grace_period = 300
+project_dir = "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0"
+template_path = "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0/experiments/training/templates/multi_node_rl_container.sbatch.j2"
+
+[ckpt]
+interval = 25
+output_dir = "/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints/prime-rl/math/qwen30b-a3b-disagg"
+
+[wandb]
+project = "prime-rl-math"
+name = "math-qwen-30b-a3b-disagg"
+
+[trainer.model]
+impl = "custom"
+attn = "flash_attention_2"
+ep = 4
+cp = 2
+
+[trainer.model.compile]
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[orchestrator]
+batch_size = 256
+group_size = 8
+
+[orchestrator.train.sampling]
+max_completion_tokens = 14336
+
+[[orchestrator.train.env]]
+name = "math"
+taskset = { id = "i3_math_v1" }
+harness = { id = "null", runtime = { type = "subprocess" } }
+
+[orchestrator.eval]
+interval = 25
+
+[[orchestrator.eval.env]]
+name = "aime2025"
+taskset = { id = "aime25-v1" }
+harness = { id = "null", runtime = { type = "subprocess" } }
+
+[inference.parallel]
+tp = 2
+
+# B300 (Blackwell) では auto が FlashInfer TRT-LLM MoE カーネルを選ぶが、
+# tp8 時に expert 中間次元 768/8 = 96 が 128 要素ブロック整列を満たさず
+# weight layout 変換で落ちた。tp2 (768/2 = 384) なら整列するはずだが、
+# 確実に動く Triton MoE に固定しておく (性能を詰める際は外して比較可)。
+# FlashInfer (attention / MoE とも auto 選択) は cu13 image の nvcc が
+# compute_103a を JIT できるため回避策不要。cu128 image に戻す場合は
+# 以下の固定が再び必要になる (どちらも Blackwell の TRT-LLM カーネル JIT 失敗対策):
+#   [inference.vllm_extra]
+#   kernel_config = { moe_backend = "triton" }
+#   attention_backend = "FLASH_ATTN"
