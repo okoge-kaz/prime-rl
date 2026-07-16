@@ -404,6 +404,9 @@ class InferenceConfig(BaseConfig):
     nixl_backends: list[str] = ["UCX"]
     """NIXL backends for the P/D KV transfer connector, in priority order (vLLM ``kv_connector_extra_config["backends"]``). ``["UCX"]`` is the vLLM default; use ``["LIBFABRIC"]`` for EFA-native RDMA on AWS clusters (requires a NIXL build with the libfabric plugin)."""
 
+    nixl_kv_lease_duration: int = 30
+    """Seconds the prefill worker keeps computed KV blocks alive waiting for the decode pull (vLLM ``kv_connector_extra_config["kv_lease_duration"]``, default 30). A pull after expiry reads freed (potentially reused) blocks — raise this when a rollout burst defers decode scheduling past the lease (e.g. 300)."""
+
     enable_return_routed_experts: bool = False
     """Return routed experts in responses. Forwarded as ``--enable-return-routed-experts``."""
 
@@ -536,7 +539,11 @@ class InferenceConfig(BaseConfig):
                 {
                     "kv_connector": "NixlConnector",
                     "kv_role": "kv_both",
-                    "kv_connector_extra_config": {"num_threads": 1, "backends": self.nixl_backends},
+                    "kv_connector_extra_config": {
+                        "num_threads": 1,
+                        "backends": self.nixl_backends,
+                        "kv_lease_duration": self.nixl_kv_lease_duration,
+                    },
                 }
             )
         if self.kv_cache_offload is not None:

@@ -93,7 +93,7 @@ ln -sfn inference/node_0.log $OUTPUT_DIR/logs/inference.log
 # Container (pyxis/enroot)
 # PRIME_RL_SQSH で差し替え可能 (sbatch はデフォルトで submit 時の環境を export するため、
 # `PRIME_RL_SQSH=... bash experiments/training/submit.sh ...` で新イメージを試せる)
-export SQSH="${PRIME_RL_SQSH:-/lustre/fsw/portfolios/coreai/users/kfujii/containers/prime-rl-v0.7.0-cu13-disagg-v3.sqsh}"
+export SQSH="${PRIME_RL_SQSH:-/lustre/fsw/portfolios/coreai/users/kfujii/containers/prime-rl-v0.7.0-cu13-disagg-v4.sqsh}"
 # FlashInfer の JIT キャッシュ (/root/.cache/flashinfer) はコンテナ内だと
 # ジョブごとに消え、毎回 compute_103a 向けカーネルの再コンパイル (10 分超) を
 # 払うことになるため、lustre 上の永続ディレクトリをマウントする。

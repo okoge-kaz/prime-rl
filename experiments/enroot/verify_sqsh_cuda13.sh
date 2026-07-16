@@ -62,6 +62,20 @@ fi
 section "3. nixl meta shim (v3, job 173696 の再発チェック)"
 check "import nixl._api" $PY -c 'import nixl._api'
 
+section "3b. NIXL LIBFABRIC plugin + EFA HMEM (v4, EFA ネイティブ KV transfer)"
+check "libplugin_LIBFABRIC.so in source-built wheel" \
+    bash -c "find /app/.venv/lib/python3.12/site-packages -path '*mesonpy.libs/plugins/libplugin_LIBFABRIC.so' | grep -q ."
+# EFA installer の libfabric が GPU バッファ (CUDA HMEM) を扱えること
+check "libfabric EFA provider reports HMEM" \
+    bash -c "/opt/amazon/efa/bin/fi_info -p efa 2>/dev/null | grep -qi hmem || /opt/amazon/efa/bin/fi_info -p efa -c FI_HMEM >/dev/null 2>&1"
+# createBackend("LIBFABRIC") まで実際に通す (job 173854 は UCX のここで死んだ)。
+# vLLM base_worker.py と同じ API 経路 (nixl_agent + nixl_agent_config)
+check "nixl_agent createBackend(LIBFABRIC)" $PY -c '
+from nixl._api import nixl_agent, nixl_agent_config
+a = nixl_agent("verify", nixl_agent_config(backends=["LIBFABRIC"]))
+print("LIBFABRIC backend created:", a.backends)
+'
+
 if [ "${RUN_KERNEL_TEST:-0}" = "1" ]; then
     section "4. DeepEP 実カーネル (intranode, 8 GPU)"
     # wheel と同じ rev のテストを使う (scripts/cuda13-build-wheels.sh の DEEPEP_REF)

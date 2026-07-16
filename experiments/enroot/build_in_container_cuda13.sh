@@ -42,6 +42,7 @@ apt-get install -y --no-install-recommends \
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
     build-essential autoconf automake libtool pkg-config ca-certificates curl sudo git ninja-build \
     libnuma-dev libnl-3-dev libnl-route-3-dev libibverbs-dev librdmacm-dev \
+    libhwloc-dev `# NIXL libfabric plugin の必須依存 (NIC トポロジ検出)` \
     python3.12 python3.12-venv python3.12-dev \
     wget clang tmux iperf git-lfs gpg iputils-ping net-tools vim \
     ibverbs-providers

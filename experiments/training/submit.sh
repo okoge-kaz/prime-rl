@@ -17,7 +17,7 @@
 #   - モデルとデータセットは experiments/dataset/ のスクリプトで事前ダウンロード済み
 #     (dry-run はモデルの pre-download をスキップするため、未ダウンロードだと
 #     ジョブ側の初回ロードで HF から落とそうとする)
-#   - sqsh: /lustre/fsw/portfolios/coreai/users/kfujii/containers/prime-rl-v0.7.0-cu13-disagg-v3.sqsh
+#   - sqsh: /lustre/fsw/portfolios/coreai/users/kfujii/containers/prime-rl-v0.7.0-cu13-disagg-v4.sqsh
 #     (template のデフォルト。PRIME_RL_SQSH 環境変数で差し替え可能)
 
 set -euo pipefail

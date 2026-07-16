@@ -25,6 +25,16 @@ type = "multi_node"
 num_train_nodes = 1
 # num_infer_nodes は inference.deployment (prefill 1 + decode 1 = 2) から自動導出
 
+[inference]
+# EFA ネイティブ KV transfer (v4 sqsh 以降)。UCX backend はこの cluster では
+# TCP フォールバックになり ~100 MB/s・41ms/転送 (job 173904 で実測)。
+# TCP baseline を取り直す場合は ["UCX"] に戻す
+nixl_backends = ["LIBFABRIC"]
+# 起動時の rollout 一斉流入で decode のスケジュールがリース (デフォルト 30s) を
+# 超え、prefill が解放済みの KV を pull する事故が出た (job 174071, 202 件/20 秒)。
+# prefill の KV 使用率は ~0.1% なので長めに保持してよい
+nixl_kv_lease_duration = 300
+
 [inference.deployment]
 type = "disaggregated"
 prefill_nodes_per_replica = 1
