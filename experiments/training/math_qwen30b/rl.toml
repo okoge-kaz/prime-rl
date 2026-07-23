@@ -20,8 +20,7 @@ job_name = "math-qwen30b"
 partition = "batch"
 account = "coreai_horizon_dilations"
 time = "2:00:00"
-# コンポーネントがクラッシュした際に teardown 前に待つ秒数 (デフォルト 3600)。
-# 長いと failed job がノードを確保し続けるので短縮。0 で即 teardown。
+# Limit teardown grace time after a component failure; zero tears down immediately.
 cleanup_grace_period = 300
 project_dir = "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0"
 template_path = "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0/experiments/training/templates/multi_node_rl_container.sbatch.j2"
@@ -72,13 +71,10 @@ harness = { id = "null", runtime = { type = "subprocess" } }
 [inference.parallel]
 tp = 2
 
-# B300 (Blackwell) では auto が FlashInfer TRT-LLM MoE カーネルを選ぶが、
-# tp8 時に expert 中間次元 768/8 = 96 が 128 要素ブロック整列を満たさず
-# weight layout 変換で落ちた。tp2 (768/2 = 384) なら整列するはずだが、
-# 確実に動く Triton MoE に固定しておく (性能を詰める際は外して比較可)。
-# FlashInfer (attention / MoE とも auto 選択) は cu13 image の nvcc が
-# compute_103a を JIT できるため回避策不要。cu128 image に戻す場合は
-# 以下の固定が再び必要になる (どちらも Blackwell の TRT-LLM カーネル JIT 失敗対策):
+# On B300, automatic selection previously chose FlashInfer TRT-LLM MoE, whose
+# tp8 shard width 768/8=96 violates 128-element block alignment. Keep the
+# verified Triton MoE backend. The CUDA 13 image can JIT compute_103a kernels;
+# a CUDA 12.8 image may also require explicit attention and sampler backends:
 #   [inference.vllm_extra]
 #   kernel_config = { moe_backend = "triton" }
 #   attention_backend = "FLASH_ATTN"

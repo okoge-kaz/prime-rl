@@ -1,0 +1,26 @@
+# Four-node validation overlay: 2 training, 1 prefill, and 1 decode node.
+# The template selects interactive QoS. Trainer parallelism is ep8 x cp2.
+#
+# Validate the GLM4 MoE trainer on B300, the tool-call loop, KV-transfer latency,
+# and prefix-cache hits.
+#
+#   bash experiments/training/submit.sh swe_intellect3_disagg validation
+
+max_steps = 3
+
+[deployment]
+num_train_nodes = 2
+
+[inference.deployment]
+num_prefill_replicas = 1
+num_decode_replicas = 1
+
+[orchestrator]
+# Keep group size 16 and use 512 inflight rollouts, close to the production
+# load per decode node.
+batch_size = 256
+# Disable swebench-verified evaluation during validation.
+eval = "None"
+
+[wandb]
+name = "swe-intellect3-disagg-val"

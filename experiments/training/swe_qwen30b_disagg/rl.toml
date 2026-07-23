@@ -1,0 +1,97 @@
+# PD-disaggregated smoke configuration based on swe_qwen30b/rl.toml.
+# max_steps=3 and batch_size=64 keep validation bounded.
+#
+# Topology: one training, one prefill, and one decode node. KV transfer uses
+# NIXL LIBFABRIC over EFA. Prime Intellect Sandboxes require PRIME_API_KEY.
+#
+# Validate the Hermes tool loop, prefix-cache reuse, incremental KV transfer,
+# long-context transfer latency, and the 300-second KV lease.
+
+max_steps = 3
+seq_len = 131072
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3-30B-A3B-Thinking-2507"
+
+[weight_broadcast]
+type = "nccl"
+
+[deployment]
+type = "multi_node"
+num_train_nodes = 1
+# num_infer_nodes is derived from inference.deployment.
+
+[inference]
+enable_request_logs = true
+nixl_backends = ["LIBFABRIC"]
+nixl_kv_lease_duration = 300
+
+[inference.deployment]
+type = "disaggregated"
+prefill_nodes_per_replica = 1
+decode_nodes_per_replica = 1
+num_prefill_replicas = 1
+num_decode_replicas = 1
+
+[slurm]
+job_name = "swe-qwen30b-disagg-smoke"
+partition = "batch"
+account = "coreai_horizon_dilations"
+time = "8:00:00"
+cleanup_grace_period = 300
+project_dir = "/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0"
+template_path = "/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0/experiments/training/templates/multi_node_rl_container.sbatch.j2"
+
+[ckpt]
+interval = 100
+
+[wandb]
+project = "prime-rl-swe"
+name = "swe-qwen30b-disagg-p1-promptfix"
+
+[trainer.model]
+impl = "custom"
+# FA3 binaries target Hopper; the image builds FlashAttention 2 for sm_103.
+attn = "flash_attention_2"
+# One training node: eight ranks = ep4 x cp2.
+ep = 4
+cp = 2
+
+[trainer.model.compile]
+
+[trainer.model.ac_offloading]
+max_inflight_activations = 5
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[orchestrator]
+# GRPO needs within-group reward variance; group size 16 avoids identically
+# zero advantages while retaining four tasks per smoke step.
+group_size = 16
+batch_size = 64
+oversampling_factor = 2
+max_off_policy_steps = 16
+
+# Drop zero-advantage groups before they consume batch capacity.
+[[orchestrator.pre_batch_filters]]
+type = "zero_advantage"
+enforce = true
+
+[[orchestrator.train.env]]
+name = "swe"
+taskset = { id = "r2e-gym-v1" }
+harness = { id = "default", runtime = { type = "prime", labels = ["swe-qwen30b-disagg-p1", "swe"] } }
+
+# Disable swebench-verified evaluation for the smoke run.
+
+# Use the B300-verified tp2, dp4-per-node, DeepEP EP8 configuration.
+[inference.parallel]
+tp = 2

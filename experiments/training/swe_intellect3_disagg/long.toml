@@ -1,0 +1,8 @@
+# Twelve-hour batch_long overlay; topology and training parameters are unchanged.
+#
+#   bash experiments/training/submit.sh swe_intellect3_disagg long
+#   bash experiments/training/submit.sh swe_intellect3_disagg long --ckpt.resume-step -1
+
+[slurm]
+partition = "batch_long"
+time = "12:00:00"

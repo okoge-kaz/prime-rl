@@ -1,0 +1,121 @@
+# Production PD-disaggregated SWE RL configuration for INTELLECT-3
+# (106B-A12B, based on GLM-4.5-Air).
+#
+# Training settings follow the INTELLECT-3 paper (arXiv:2512.16144):
+#   - 256 prompts × group 16 = 4096 samples/step
+#   - Muon, lr 1e-6
+#   - 65,536-token context and max_off_policy_steps 8
+#   - R2E-Gym with a 200-turn cap
+# This configuration uses the verified zero-advantage filter and oversampling 2.
+#
+# Topology: 4 training + 4 prefill + 12 decode nodes. The renderer requires the
+# local deps/renderers prime-qwen3 patch for the model's ChatML and XML tool-call
+# format.
+#
+# Submit:
+#   bash experiments/training/submit.sh swe_intellect3_disagg
+#   bash experiments/training/submit.sh swe_intellect3_disagg long
+#   bash experiments/training/submit.sh swe_intellect3_disagg --ckpt.resume-step -1
+
+seq_len = 65536
+
+[log]
+level = "debug"
+
+[model]
+name = "PrimeIntellect/INTELLECT-3"
+
+[weight_broadcast]
+type = "nccl"
+
+[deployment]
+type = "multi_node"
+num_train_nodes = 4
+# num_infer_nodes is derived from inference.deployment.
+
+[inference]
+enable_request_logs = true
+nixl_backends = ["LIBFABRIC"]
+nixl_kv_lease_duration = 300
+
+[inference.deployment]
+type = "disaggregated"
+prefill_nodes_per_replica = 1
+decode_nodes_per_replica = 1
+num_prefill_replicas = 4
+num_decode_replicas = 12
+
+[slurm]
+job_name = "swe-intellect3-disagg"
+partition = "batch"
+account = "coreai_horizon_dilations"
+time = "4:00:00"
+cleanup_grace_period = 300
+project_dir = "/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0"
+template_path = "/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0/experiments/training/templates/multi_node_rl_container.sbatch.j2"
+
+# Save checkpoints frequently enough for the four-hour wall time.
+[ckpt]
+interval = 5
+
+[wandb]
+project = "prime-rl-swe"
+name = "swe-intellect3-disagg"
+
+[trainer.model]
+impl = "custom"
+# FA3 binaries target Hopper; use FlashAttention 2 on B300.
+attn = "flash_attention_2"
+# Four nodes: 32 ranks = ep8 x cp2 x dp2, with 16 routed experts per EP rank.
+ep = 8
+cp = 2
+fused_lm_head_token_chunk_size = 1024
+
+[trainer.model.compile]
+
+[trainer.model.ac_offloading]
+max_inflight_activations = 5
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "muon"
+lr = 1e-6
+weight_decay = 0.01
+
+[orchestrator]
+# 256 prompts x 16 rollouts = 4096 samples per step.
+group_size = 16
+batch_size = 4096
+oversampling_factor = 2
+max_off_policy_steps = 8
+
+# Drop groups with zero advantage before they consume batch capacity.
+[[orchestrator.pre_batch_filters]]
+type = "zero_advantage"
+enforce = true
+
+[[orchestrator.train.env]]
+name = "swe"
+taskset = { id = "r2e-gym-v1" }
+harness = { id = "default", runtime = { type = "prime", labels = ["swe-intellect3-disagg", "swe"] } }
+
+[orchestrator.eval]
+interval = 25
+
+[[orchestrator.eval.env]]
+name = "swe-bench-verified"
+taskset = { id = "swebench-verified-v1" }
+harness = { id = "default", runtime = { type = "prime", labels = ["swe-intellect3-disagg", "swe-bench-verified"] } }
+
+# INTELLECT-3 uses ChatML with Qwen3-Coder-style XML tool calls. The prime-qwen3
+# renderer needs the local backport and generation-prompt thinking support:
+#   Apply experiments/patches/renderers-prime-qwen3-intellect3.patch to deps/renderers.
+# Token parity and schema-aware tool-call parsing have been verified.
+[orchestrator.renderer]
+name = "prime-qwen3"
+
+# tp2, dp4 per node, and DeepEP EP are verified on B300.
+[inference.parallel]
+tp = 2

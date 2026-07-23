@@ -1,7 +1,7 @@
-# SWE RL で Qwen3-30B-A3B-Thinking-2507 — examples/qwen30b_swe/rl.toml ベース
-# (train 2 nodes + inference 2 nodes)。学習 taskset は r2e-gym-v1、eval は
-# swebench-verified-v1。報酬計算は Prime Intellect Sandboxes 上で行われる
-# (.env の PRIME_API_KEY が必要)。
+# SWE RL with Qwen3-30B-A3B-Thinking-2507, based on examples/qwen30b_swe.
+# Two training and two inference nodes; r2e-gym-v1 trains and
+# swebench-verified-v1 evaluates. Prime Intellect Sandboxes require
+# PRIME_API_KEY in .env.
 
 seq_len = 131072
 
@@ -36,7 +36,8 @@ name = "swe-qwen30b-r2e-gym"
 
 [trainer.model]
 impl = "custom"
-attn = "flash_attention_3"
+# FA3 binaries target Hopper; the image builds FlashAttention 2 for sm_103.
+attn = "flash_attention_2"
 ep = 8
 cp = 2
 

@@ -1,12 +1,9 @@
-# math_qwen30b/rl.toml の PD (prefill/decode) disaggregation 版。
-# 学習ハイパラはそちらと同一に保ち、inference 側だけ
-# prefill 1 ノード + decode 1 ノードの disaggregated 構成に変える
-# (比較実験のため)。合計ノード数は 3 (train 1 + prefill 1 + decode 1)。
+# PD-disaggregated variant of math_qwen30b/rl.toml. Training hyperparameters
+# remain unchanged; inference uses one prefill and one decode node, for three
+# total nodes including the trainer.
 #
-# 前提: cu13-disagg イメージ (NIXL + /opt/ucx + deep-ep/deep-gemm 入り)。
-# テンプレート側 (multi_node_rl_container.sbatch.j2) が is_disaggregated を
-# 見て vllm-router に --prefill/--decode エンドポイントを渡す。
-# KV 転送は NIXL (UCX 1.19 ソースビルド、#2883 対策済み) 経由。
+# Requires the CUDA 13 disaggregated image with NIXL, UCX, DeepEP, and DeepGEMM.
+# The container template supplies prefill/decode endpoints to vllm-router.
 
 max_steps = 100
 seq_len = 16384
@@ -23,16 +20,12 @@ type = "nccl"
 [deployment]
 type = "multi_node"
 num_train_nodes = 1
-# num_infer_nodes は inference.deployment (prefill 1 + decode 1 = 2) から自動導出
+# num_infer_nodes is derived from inference.deployment.
 
 [inference]
-# EFA ネイティブ KV transfer (v4 sqsh 以降)。UCX backend はこの cluster では
-# TCP フォールバックになり ~100 MB/s・41ms/転送 (job 173904 で実測)。
-# TCP baseline を取り直す場合は ["UCX"] に戻す
+# Use EFA-native KV transfer. Set ["UCX"] only when measuring the TCP baseline.
 nixl_backends = ["LIBFABRIC"]
-# 起動時の rollout 一斉流入で decode のスケジュールがリース (デフォルト 30s) を
-# 超え、prefill が解放済みの KV を pull する事故が出た (job 174071, 202 件/20 秒)。
-# prefill の KV 使用率は ~0.1% なので長めに保持してよい
+# Retain prefill KV long enough for startup bursts to reach decode scheduling.
 nixl_kv_lease_duration = 300
 
 [inference.deployment]
@@ -47,8 +40,7 @@ job_name = "math-qwen30b-disagg"
 partition = "batch"
 account = "coreai_horizon_dilations"
 time = "2:00:00"
-# コンポーネントがクラッシュした際に teardown 前に待つ秒数 (デフォルト 3600)。
-# 長いと failed job がノードを確保し続けるので短縮。0 で即 teardown。
+# Limit teardown grace time after a component failure.
 cleanup_grace_period = 300
 project_dir = "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0"
 template_path = "/lustre/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0/experiments/training/templates/multi_node_rl_container.sbatch.j2"
@@ -99,13 +91,9 @@ harness = { id = "null", runtime = { type = "subprocess" } }
 [inference.parallel]
 tp = 2
 
-# B300 (Blackwell) では auto が FlashInfer TRT-LLM MoE カーネルを選ぶが、
-# tp8 時に expert 中間次元 768/8 = 96 が 128 要素ブロック整列を満たさず
-# weight layout 変換で落ちた。tp2 (768/2 = 384) なら整列するはずだが、
-# 確実に動く Triton MoE に固定しておく (性能を詰める際は外して比較可)。
-# FlashInfer (attention / MoE とも auto 選択) は cu13 image の nvcc が
-# compute_103a を JIT できるため回避策不要。cu128 image に戻す場合は
-# 以下の固定が再び必要になる (どちらも Blackwell の TRT-LLM カーネル JIT 失敗対策):
+# Keep the verified Triton MoE backend because the tp8 shard width 768/8=96
+# violates FlashInfer TRT-LLM MoE block alignment. CUDA 12.8 images may also
+# require explicit attention and sampler backends:
 #   [inference.vllm_extra]
 #   kernel_config = { moe_backend = "triton" }
 #   attention_backend = "FLASH_ATTN"
