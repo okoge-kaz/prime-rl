@@ -1,12 +1,8 @@
 #!/bin/bash
-# compute node のホスト環境を検証する (コンテナ無しの srun で実行する):
-#   1. GDRCopy — kernel module (gdrdrv) / /dev/gdrdrv / userland lib (libgdrapi)
-#   2. EFA — kernel module / RDMA デバイス一覧 / libfabric provider
-#   3. GPUDirect RDMA の前提 — nvidia_peermem または dmabuf (kernel >= 5.12)
-#   4. aws-ofi-nccl プラグイン — 存在とバージョン (GIN 対応判定の材料)
-# read-only チェックのみ。ホストに何も変更しない。
+# Run read-only host checks on a compute node without a container:
+# GDRCopy, EFA/libfabric, GPUDirect prerequisites, and aws-ofi-nccl.
 #
-# 実行例:
+# Example:
 #   srun --account=coreai_horizon_dilations --partition=batch --qos=interactive \
 #       --job-name=check-host-efa --time=00:05:00 --nodes=1 --ntasks=1 --gpus-per-node=1 \
 #       bash experiments/enroot/check_host_efa_gdrcopy.sh
@@ -29,10 +25,10 @@ else
     echo "NG: /dev/gdrdrv not found"
 fi
 
-section "1b. GDRCopy (host userland lib — コンテナへの mount 候補)"
+section "1b. GDRCopy host userland library"
 ldconfig -p | grep gdrapi || true
 find /usr/lib /usr/lib64 /usr/local /opt -maxdepth 4 -name 'libgdrapi.so*' 2>/dev/null || true
-# バージョンは so の SONAME (libgdrapi.so.2.x) で判別する
+# Infer the version from the libgdrapi.so.2.x SONAME.
 
 section "2. EFA kernel module"
 if lsmod | grep -q '^efa'; then
@@ -42,7 +38,7 @@ else
     echo "NG: efa module NOT loaded"
 fi
 
-section "2b. RDMA devices (rdmap* = EFA, ibp* = 別系統)"
+section "2b. RDMA devices (rdmap* = EFA; ibp* = unrelated)"
 if [ -d /sys/class/infiniband ]; then
     for d in /sys/class/infiniband/*; do
         name=$(basename "$d")
@@ -63,14 +59,14 @@ if [ -n "$FI_INFO" ]; then
     "$FI_INFO" --version 2>/dev/null | head -2
     "$FI_INFO" -p efa -t FI_EP_RDM 2>&1 | head -10
 else
-    echo "NG: fi_info not found (EFA installer 未導入?)"
+    echo "NG: fi_info not found; the EFA installer may be missing"
 fi
 
-section "3. GPUDirect RDMA 前提 (nvidia_peermem or dmabuf)"
+section "3. GPUDirect RDMA prerequisites (nvidia_peermem or dmabuf)"
 if lsmod | grep -q nvidia_peermem; then
     echo "OK: nvidia_peermem loaded"
 else
-    echo "-- nvidia_peermem not loaded (kernel >= 5.12 なら EFA は dmabuf 経路で GPUDirect 可)"
+    echo "-- nvidia_peermem not loaded; EFA can use dmabuf on kernel >= 5.12"
 fi
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1
 
@@ -81,7 +77,7 @@ if [ -d /opt/amazon/ofi-nccl/lib ]; then
         [ -e "$so" ] || continue
         echo "-- strings version tags in $(basename "$so"):"
         strings "$so" | grep -iE 'aws-ofi-nccl.*[0-9]+\.[0-9]+|^NET/OFI' | sort -u | head -5
-        echo "-- GIN symbols (GPU-Initiated Networking 対応判定):"
+        echo "-- GIN symbols for GPU-Initiated Networking support:"
         { nm -D "$so" 2>/dev/null || strings "$so"; } | grep -ci gin || true
     done
 else
@@ -90,6 +86,6 @@ fi
 [ -f /opt/amazon/efa_installed_packages ] && { echo "-- efa_installed_packages:"; head -20 /opt/amazon/efa_installed_packages; }
 
 section "summary hints"
-echo "gdrdrv + /dev/gdrdrv があれば: コンテナ側に libgdrapi を入れる(or mount)だけで GDRCopy 警告は解消可能"
-echo "gdrdrv が無ければ: クラスタ管理者にホスト AMI への gdrcopy 導入を依頼 (コンテナ側では解決不可)"
-echo "libgdrapi がホストにあれば: CONTAINER_MOUNTS + LD_LIBRARY_PATH 追加で再ビルド無しに検証可能"
+echo "With gdrdrv and /dev/gdrdrv, add or mount libgdrapi in the container."
+echo "Without gdrdrv, ask the cluster administrator to add GDRCopy to the host AMI."
+echo "A host libgdrapi can be tested through CONTAINER_MOUNTS and LD_LIBRARY_PATH."

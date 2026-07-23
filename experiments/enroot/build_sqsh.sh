@@ -1,17 +1,11 @@
 #!/bin/bash
-# pyxis の --container-save で prime-rl (PD disaggregation 入り) の sqsh を直接 build する
+# Build a prime-rl sqsh with PD disaggregation via pyxis --container-save.
 #
-# 背景: rootless podman はこのクラスタでは使えない (/etc/subuid が未設定のため
-# コンテナ内で root 以外の UID に遷移できず、apt が _apt への権限降格で死ぬ)。
-# enroot は seccomp で setuid 系システムコールを偽装するため、enroot コンテナ内では
-# apt もソースビルドもそのまま動く。これを利用して Dockerfile.cuda 相当のビルドを
-# compute node (cpu partition) 上のコンテナ内で実行し、ジョブ終了時に pyxis が
-# コンテナの状態を sqsh として保存する。
+# Rootless podman cannot switch UIDs on this cluster because /etc/subuid is not
+# configured. Enroot's seccomp emulation allows apt and source builds, and pyxis
+# saves the resulting container state as sqsh.
 #
-# - build は srun 経由で compute node 上で走る (login node では実行されない)
-# - この方式では Docker Hub への push はできない (成果物は sqsh のみ)
-# - 公開イメージ (docker.io/primeintellect/prime-rl, disagg なし) の import は
-#   enroot_sqsh.sh を参照
+# The build runs through srun on a compute node and produces only a local sqsh.
 
 set -euo pipefail
 

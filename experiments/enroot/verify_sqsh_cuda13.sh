@@ -1,19 +1,15 @@
 #!/bin/bash
-# cu13-disagg sqsh の検証。コンテナ内・GPU ノードで実行する。
-# 検証対象:
-#   1. GDRCopy userland (libgdrapi) — dlopen できること (v2 で追加)
-#   2. deep_ep の device-link — sm_75 空リンク (job 171729 の原因) が直り
-#      sm_103 の SASS が入っていること + 実カーネルが 8 GPU で動くこと (v2 で修正)
-#   3. nixl meta shim — `import nixl._api` できること (job 173696 の原因, v3 で修正)
-# チェックは途中で止まらず全件実行し、最後に NG 件数で exit code を決める。
+# Validate the CUDA 13 disaggregated sqsh on a GPU node:
+# GDRCopy userland, DeepEP sm_103 device-link and kernels, and the NIXL shim.
+# Run every check and return the number of failures at the end.
 #
-# 実行例 (静的チェックのみ、~1 分):
+# Static checks:
 #   srun --account=coreai_horizon_dilations --partition=batch --qos=interactive \
 #       --job-name=verify-sqsh --time=00:15:00 --nodes=1 --ntasks=1 --gpus-per-node=1 \
 #       --container-image=<sqsh> --container-mounts=$PWD:$PWD \
 #       bash $PWD/experiments/enroot/verify_sqsh_cuda13.sh
 #
-# 実カーネルテストまで行う場合は --gpus-per-node=8 で RUN_KERNEL_TEST=1 を付ける:
+# Add RUN_KERNEL_TEST=1 with eight GPUs for real DeepEP kernel tests:
 #   ... --gpus-per-node=8 bash -c "RUN_KERNEL_TEST=1 bash $PWD/experiments/enroot/verify_sqsh_cuda13.sh"
 
 set -uo pipefail
@@ -37,10 +33,9 @@ ls -l /usr/local/lib/libgdrapi.so* 2>/dev/null
 ls -l /dev/gdrdrv 2>/dev/null
 check "libgdrapi dlopen" $PY -c 'import ctypes; ctypes.CDLL("libgdrapi.so")'
 
-section "2. deep_ep device-link arch (v2, job 171729 の再発チェック)"
+section "2. DeepEP device-link architecture (job 171729 regression)"
 check "deep_ep/deep_gemm import" $PY -c 'import deep_ep, deep_gemm'
-# 拡張 .so を deep_ep パッケージ周辺から探す (モジュール名はビルドにより
-# deep_ep_cpp / deep_ep.deep_ep_cpp 等で揺れるため import 名に依存しない)
+# Find the extension by path because its import name varies by build.
 SO=$($PY - <<'EOF' 2>/dev/null || true
 import deep_ep, glob, os
 pkg = os.path.dirname(deep_ep.__file__)
@@ -52,24 +47,23 @@ EOF
 if [ -n "$SO" ]; then
     echo "so: $SO"
     cuobjdump --list-elf "$SO" | grep -o 'sm_[0-9a-f]*' | sort | uniq -c
-    # 旧 v1 の壊れた build は device-link cubin が sm_75 (gencode 欠落) だった
+    # The broken v1 build linked an sm_75 cubin because gencode was missing.
     check "no sm_75 dlink" bash -c "! cuobjdump --list-elf '$SO' | grep -q sm_75"
     check "sm_103 SASS present" bash -c "cuobjdump --list-elf '$SO' | grep -q sm_103"
 else
-    echo "NG: deep_ep_cpp が import できず arch 検査不能"; NG=$((NG + 1))
+    echo "NG: cannot import deep_ep_cpp to inspect its architecture"; NG=$((NG + 1))
 fi
 
-section "3. nixl meta shim (v3, job 173696 の再発チェック)"
+section "3. NIXL meta shim (job 173696 regression)"
 check "import nixl._api" $PY -c 'import nixl._api'
 
-section "3b. NIXL LIBFABRIC plugin + EFA HMEM (v4, EFA ネイティブ KV transfer)"
+section "3b. NIXL LIBFABRIC plugin and EFA HMEM"
 check "libplugin_LIBFABRIC.so in source-built wheel" \
     bash -c "find /app/.venv/lib/python3.12/site-packages -path '*mesonpy.libs/plugins/libplugin_LIBFABRIC.so' | grep -q ."
-# EFA installer の libfabric が GPU バッファ (CUDA HMEM) を扱えること
+# Confirm that the EFA libfabric build supports CUDA HMEM.
 check "libfabric EFA provider reports HMEM" \
     bash -c "/opt/amazon/efa/bin/fi_info -p efa 2>/dev/null | grep -qi hmem || /opt/amazon/efa/bin/fi_info -p efa -c FI_HMEM >/dev/null 2>&1"
-# createBackend("LIBFABRIC") まで実際に通す (job 173854 は UCX のここで死んだ)。
-# vLLM base_worker.py と同じ API 経路 (nixl_agent + nixl_agent_config)
+# Exercise the same createBackend("LIBFABRIC") API path used by vLLM.
 check "nixl_agent createBackend(LIBFABRIC)" $PY -c '
 from nixl._api import nixl_agent, nixl_agent_config
 a = nixl_agent("verify", nixl_agent_config(backends=["LIBFABRIC"]))
@@ -77,19 +71,19 @@ print("LIBFABRIC backend created:", a.backends)
 '
 
 if [ "${RUN_KERNEL_TEST:-0}" = "1" ]; then
-    section "4. DeepEP 実カーネル (intranode, 8 GPU)"
-    # wheel と同じ rev のテストを使う (scripts/cuda13-build-wheels.sh の DEEPEP_REF)
+    section "4. DeepEP intranode kernels (8 GPUs)"
+    # Use tests from the same revision as the wheel.
     DEEPEP_REF=29d31c095796f3c8ece47ee9cdcc167051bbeed9
     rm -rf /tmp/DeepEP-test
     git clone https://github.com/deepseek-ai/DeepEP /tmp/DeepEP-test
     git -C /tmp/DeepEP-test checkout "$DEEPEP_REF"
     cd /tmp/DeepEP-test
-    # HT 経路 (prefill 側 = job 171729 で layout.cu が落ちた経路)
+    # High-throughput prefill path.
     check "test_intranode (HT)" $PY tests/test_intranode.py
-    # LL 経路 (decode 側 = NVSHMEM device state 999 で落ちた経路)
+    # Low-latency decode path.
     check "test_low_latency (LL)" $PY tests/test_low_latency.py
 else
-    echo; echo "(実カーネルテストは RUN_KERNEL_TEST=1 + --gpus-per-node=8 で実行)"
+    echo; echo "(Set RUN_KERNEL_TEST=1 and request eight GPUs for kernel tests.)"
 fi
 
 section "result"

@@ -1,23 +1,18 @@
 #!/bin/bash
-# pyxis の --container-save で prime-rl の CUDA 13.0 版 sqsh (disagg 入り) を build する
-# (build_sqsh.sh の cu13 変種。仕組みの背景コメントはそちらを参照)
+# Build a CUDA 13.0 prime-rl sqsh with disaggregation via pyxis --container-save.
 #
-# CUDA 13.0 を選ぶ理由:
-#   - B300 (sm_103) は CUDA >= 12.9 が必要で、cu128 toolchain ではターゲットにできない
-#   - ノードのドライバは r580 (= CUDA 13.0 対応上限) なので 13.1+ は使わない
+# B300 (sm_103) requires CUDA >=12.9, while the r580 driver caps the toolkit at 13.0.
 #
-# disagg (deep-ep / deep-gemm / nixl / vllm-router) 込み。deep-ep / deep-gemm は
-# cu12 prebuilt wheel の代わりにコンテナ内で CUDA 13 に対してソースビルドする。
+# DeepEP, DeepGEMM, and flash-attn are built from source for CUDA 13.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTAINERS_DIR="/lustre/fsw/portfolios/coreai/users/kfujii/containers"
 CACHE_DIR="${CONTAINERS_DIR}/cache"
-# v2 (2026-07-16): deep-ep の device-link 修正 (NVSHMEM 'arch' パス問題) + GDRCopy userland 追加
-# v3 (2026-07-16): nixl meta shim 修正 (job 173696)。v2 は nixl 修正がスクリプトに
-#   入る前にビルドされたため `import nixl` が無い
-# v4 (2026-07-16): NIXL の LIBFABRIC plugin 有効化 (EFA ネイティブ KV transfer 用)
+# v2: DeepEP device-link fix and GDRCopy userland.
+# v3: NIXL meta shim fix for job 173696.
+# v4: NIXL LIBFABRIC plugin for native EFA KV transfer.
 SQSH_FILE="${CONTAINERS_DIR}/prime-rl-v0.7.0-cu13-disagg-v4.sqsh"
 BASE_IMAGE="docker://nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04"
 
@@ -31,8 +26,7 @@ mkdir -p "${CONTAINERS_DIR}" "${CACHE_DIR}/uv"
 cd "${REPO_ROOT}"
 git submodule update --init --recursive
 
-# GPU ノード (batch + interactive QoS) でビルドする: すぐ確保でき、ビルド末尾で
-# deep_ep / deep_gemm の import 検証 (要ドライバ) までできる
+# Build on a GPU node so the final DeepEP/DeepGEMM import checks have a driver.
 srun --account=coreai_horizon_dilations \
     --partition=batch \
     --qos=interactive \
