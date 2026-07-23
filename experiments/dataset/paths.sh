@@ -1,11 +1,10 @@
 #!/bin/bash
-# 共通パス定義 + .env 読み込み。各 download スクリプトから source される。
+# Shared cache paths and .env loading for dataset download scripts.
 #
-# ストレージ配置:
-#   hf_checkpoints/hub : HF hub cache (モデル。HF の仕様上 dataset repo の生ファイルも入る)
-#   datasets/          : HF datasets の処理済み arrow cache
-#   cache/harbor       : harbor taskset cache (swebench-verified-v1 等)
-#   checkpoints/       : 学習 checkpoint (rl --output-dir で使う)
+#   hf_checkpoints/hub : Hugging Face model and raw dataset cache
+#   datasets/          : processed Arrow cache
+#   cache/harbor       : Harbor taskset cache
+#   checkpoints/       : training checkpoints
 
 LUSTRE_USER_DIR="/lustre/fsw/portfolios/coreai/users/kfujii"
 

@@ -1,16 +1,4 @@
 #!/bin/bash
-# eval 用 taskset (swebench-verified-v1) の harbor データを事前ダウンロードする。
-#
-# harbor taskset の cache パスは ~/.cache/harbor にハードコードされている
-# (deps/verifiers/verifiers/v1/tasksets/harbor/taskset.py の CACHE 定数、環境変数なし)。
-# home quota を避けるため、実体を lustre に置いて ~/.cache/harbor から symlink する。
-#
-# cache ディレクトリ名は taskset.py の cache_dir() と同じ規則:
-#   dataset id の "/" を "_" に置換 (selector が dataset のみなので digest なし)
-#
-# 実行例 (login node では実行しない):
-#   srun -A coreai_horizon_dilations -p cpu_datamover -t 1:00:00 \
-#     bash experiments/dataset/download_swebench_verified.sh
 
 set -euo pipefail
 
@@ -19,11 +7,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/paths.sh"
 DATASET="swe-bench/swe-bench-verified"
 CACHE_NAME="${DATASET//\//_}"
 
-# ~/.cache/harbor -> lustre の symlink を張る
+# Link Harbor's fixed cache path to Lustre.
 mkdir -p "${HOME}/.cache"
 if [ -e "${HOME}/.cache/harbor" ] && [ ! -L "${HOME}/.cache/harbor" ]; then
-    echo "ERROR: ${HOME}/.cache/harbor が実ディレクトリとして存在します。" >&2
-    echo "中身を ${HARBOR_CACHE_DIR} に移してから削除してください。" >&2
+    echo "ERROR: ${HOME}/.cache/harbor exists as a real directory." >&2
+    echo "Move its contents to ${HARBOR_CACHE_DIR}, then remove it." >&2
     exit 1
 fi
 ln -sfn "${HARBOR_CACHE_DIR}" "${HOME}/.cache/harbor"
@@ -33,8 +21,7 @@ if [ -d "${HARBOR_CACHE_DIR}/${CACHE_NAME}" ]; then
     exit 0
 fi
 
-# taskset.py の dataset_dir() と同様に、temp に export してから rename する
-# (失敗時に不完全な cache を残さないため)
+# Export to a temporary directory and rename it atomically.
 cd "${REPO_ROOT}"
 TMP_EXPORT="$(mktemp -d --tmpdir="${HARBOR_CACHE_DIR}")"
 trap 'rm -rf "${TMP_EXPORT}"' EXIT

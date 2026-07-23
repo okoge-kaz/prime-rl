@@ -1,11 +1,4 @@
 #!/bin/bash
-# math RL 学習用の INTELLECT-3-RL (math subset) を事前ダウンロードする。
-# i3_math_v1 環境 (deps/research-environments/environments/math/i3_math_v1) は
-# load_dataset("PrimeIntellect/INTELLECT-3-RL", "math", split="train") を使う。
-#
-# 実行例 (login node では実行しない):
-#   srun -A coreai_horizon_dilations -p cpu_datamover -t 1:00:00 \
-#     bash experiments/dataset/download_i3_math.sh
 
 set -euo pipefail
 

@@ -12,6 +12,8 @@ description: Monitor an ongoing prime-rl training run — find the output direct
 1. Find the output dir and read the resolved configs at `{output_dir}/configs/` (start with `rl.toml`).
 2. Confirm all processes are alive and the run is making progress.
 3. Write the initial summary into `{output_dir}/STATUS.md`.
+4. For runs under `experiments/`, add the job ID, output directory, and launch objective
+   to `experiments/notes/daily/YYYY-MM-DD.md`.
 
 ### Recurring check-ins
 
@@ -33,6 +35,11 @@ Default cadence: **1 hour** (researcher can override). At each check-in:
 
 **Notes**: anything unusual (errors, restarts, hangs). Omit if nothing notable.
 ```
+
+`STATUS.md` is the run-local operational log. When a check-in produces an experimental
+finding, failure diagnosis, or direction change, also append the evidence, decision, and
+next action to `experiments/notes/daily/YYYY-MM-DD.md`. Do not copy routine healthy
+check-ins into the repository note.
 
 In W&B, each project auto-gets an **"overview" saved view** (train / eval / stability / performance sections) on its first run — use it for a quick check instead of the auto-generated default workspace.
 
@@ -73,6 +80,9 @@ After a restart, verify all processes are back up and progress resumed before th
 ├── inference/
 │   ├── node_*.log             # per-node (multi-node only)
 │   └── router_0.log           # vllm-router per replica (multi-node only)
+├── requests/                  # per-request serving JSONL (inference.enable_request_logs)
+│   └── {host}-pid{N}.jsonl    # kind=request (queue/prefill/decode times, cached tokens) + kind=kv_transfer (NIXL recv/send done)
+├── weight_updates.jsonl       # one line per policy-version switch (start/end wall-clock)
 └── envs/{train,eval}/{env_name}.log    # one log file per env
 ```
 
@@ -142,7 +152,12 @@ rollout the moment it arrives — errored, filtered, and never-batched ones incl
 crash-durable; `effective` gets the clean subset that went into the step's train batch (eval:
 the non-errored epoch cohort; multiple eval envs share the step file). Each record carries
 `kind`, `env_name`, `group_id`, `policy_version`, and `eval_step`, plus `runtime` (config +
-provisioned resource id, e.g. the sandbox id).
+provisioned resource id, e.g. the sandbox id). Sampled nodes additionally carry `request_id`
+(the engine request id — embeds the trace id, joins to `logs/requests/*.jsonl`) and
+`request_ts` (turn-start wall-clock; `timestamp` is commit time, so the gap from a sampled
+node's `timestamp` to the next sampled node's `request_ts` is that turn's tool-execution
+window, and joining `request_ts` against `logs/weight_updates.jsonl` recovers the per-turn
+policy version).
 
 ```bash
 wc -l {output_dir}/rollouts/step_42/train/{all,effective}/traces.jsonl

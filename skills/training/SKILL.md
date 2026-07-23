@@ -11,3 +11,17 @@ Two phases — start the run, then watch it.
 - **Monitor a run** — see `monitor-run/SKILL.md` for the runbook: how to find the output dir, what to tail, which metrics to watch, and how to restart safely.
 
 Both subskills assume the `configs` skill for config-loading mechanics.
+
+## Experiment record
+
+For work under `experiments/`, follow the repository experiment-note policy:
+
+- Before a launch, append the objective, hypothesis, config/overlay, and intended
+  comparison to `experiments/notes/daily/YYYY-MM-DD.md`.
+- After inspection, append the job ID, measured evidence, decision, and next action.
+- Record a failure or direction change in the daily note instead of accumulating
+  historical rationale in the script or TOML header.
+- Keep experiment comments and help text in English. Japanese research notes belong only
+  under `experiments/notes/`.
+- Update the relevant thematic note when a result changes the durable interpretation of
+  the experiment.

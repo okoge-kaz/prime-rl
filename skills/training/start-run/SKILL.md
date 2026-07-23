@@ -7,6 +7,12 @@ description: How to launch prime-rl training runs — the `rl`, `sft`, and `infe
 
 All entrypoints run via `uv run <command>` and accept TOML configs via `@ path/to.toml` plus CLI overrides.
 
+For an experiment launch, first append an entry to
+`experiments/notes/daily/YYYY-MM-DD.md` with the objective, hypothesis, exact config and
+overlay, expected outputs, and success/failure criteria. After submission, add the job ID
+and output directory to the same entry. Do not use a long script/config header as the
+experiment record.
+
 ## Config system at a glance
 
 [`pydantic-config`](https://github.com/PrimeIntellect-ai/pydantic-config) — Pydantic-based TOML + CLI loader. Highlights (see the `configs` skill for full mechanics):
