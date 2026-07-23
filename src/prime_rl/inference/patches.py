@@ -1,5 +1,6 @@
 import torch
 
+from prime_rl.inference.request_log import log_kv_transfer_event, monkey_patch_request_stat_logger
 from prime_rl.inference.vllm.padded_input_scrub import monkey_patch_vllm_padded_input_scrub
 
 
@@ -19,6 +20,7 @@ def apply_shared_vllm_patches():
     monkey_patch_vllm_padded_input_scrub()
     monkey_patch_return_routed_experts_with_nixl_connector()
     monkey_patch_kv_xfer_finished_tolerate_freed()
+    monkey_patch_request_stat_logger()
 
 
 def monkey_patch_kv_xfer_finished_tolerate_freed():
@@ -59,6 +61,7 @@ def monkey_patch_kv_xfer_finished_tolerate_freed():
 
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
+            log_kv_transfer_event("recv_done", req_id)
             # Stale notification for a request freed earlier this step (e.g. an
             # aborted request whose send completion freed it). Nothing to do.
             if req_id not in self.requests:
@@ -71,6 +74,7 @@ def monkey_patch_kv_xfer_finished_tolerate_freed():
                 self._free_blocks(self.requests[req_id])
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
+            log_kv_transfer_event("send_done", req_id)
             # See above: the recving branch may have already freed an aborted
             # request whose send also completed this step.
             if req_id not in self.requests:

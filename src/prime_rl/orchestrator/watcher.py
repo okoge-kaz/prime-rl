@@ -5,6 +5,7 @@ orchestrator's barrier bounds the in-flight lead."""
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
@@ -112,6 +113,7 @@ class WeightWatcher:
 
             get_logger().debug(f"Updating weights to step {next_step}")
             t1 = time.perf_counter()
+            update_start_ts = time.time()
             await self.inference.update_weights(weights_path, lora_name=self.lora_name, step=next_step)
             self.last_update_weights_time = time.perf_counter() - t1
             self.update_count += 1
@@ -119,6 +121,7 @@ class WeightWatcher:
 
             self.ckpt_step = next_step
             self.policy.version = next_step
+            self.append_weight_update_record(next_step, update_start_ts)
             if self.lora_name is not None:
                 self.inference.update_model_name(self.lora_name)
                 self.policy.model_name = self.lora_name
@@ -130,6 +133,16 @@ class WeightWatcher:
                     get_logger().warning(
                         f"Observer {type(observer).__name__}.on_new_version({next_step}) raised: {exc!r}"
                     )
+
+    def append_weight_update_record(self, version: int, update_start_ts: float) -> None:
+        """Append one line to ``logs/weight_updates.jsonl`` — the wall-clock window of each
+        policy-version switch. Joins per-turn `request_ts` in traces.jsonl (and serving-side
+        request logs) to the policy version that actually served the turn."""
+        path = self.config.output_dir / "logs" / "weight_updates.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {"policy_version": version, "update_start_ts": update_start_ts, "update_end_ts": time.time()}
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
     def gauges(self) -> dict[str, float]:
         return {

@@ -339,6 +339,9 @@ class InferenceConfig(BaseConfig):
     log: LogConfig = LogConfig()
     """Logging configuration."""
 
+    enable_request_logs: bool = False
+    """Write one JSONL line per finished inference request (queue/prefill/decode durations, cached/prompt/output token counts, finish reason, engine identity) plus per-request NIXL KV-transfer completion events to ``<output_dir>/logs/requests/``. Buffered background writes off the engine hot path; join to ``traces.jsonl`` via the trace id embedded in the request id."""
+
     env_vars: EnvVars = {}
     """Extra environment variables for the inference server process(es). Merged on top of the launcher defaults."""
 

@@ -26,6 +26,11 @@ def setup_vllm_env(config: InferenceConfig):
     # sees. Keep it off so rollout logprobs stay faithful for importance ratios.
     os.environ.setdefault("VLLM_ENFORCE_STRICT_TOOL_CALLING", "0")
 
+    if config.enable_request_logs:
+        # Read by the request-log patches in every vLLM process (API servers and
+        # spawned engine cores inherit the env).
+        os.environ.setdefault("PRIME_REQUEST_LOG_DIR", str(config.output_dir / "logs" / "requests"))
+
     deep_gemm_enabled = "1" if config.use_deep_gemm else "0"
     os.environ["VLLM_USE_DEEP_GEMM"] = deep_gemm_enabled
     os.environ["VLLM_MOE_USE_DEEP_GEMM"] = deep_gemm_enabled
