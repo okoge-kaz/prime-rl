@@ -1,0 +1,11 @@
+# P:D 1:3 overlay: two training, one prefill, and three decode nodes.
+# This arm reallocates capacity toward the decode-bound stage.
+#
+#   bash experiments/training/submit.sh swe_replay_bench pd13
+
+[inference.deployment]
+num_prefill_replicas = 1
+num_decode_replicas = 3
+
+[wandb]
+name = "swe-replay-bench-pd13"

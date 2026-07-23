@@ -1,0 +1,99 @@
+# Colocated SWE replay baseline. Each inference replica handles both prefill
+# and decode, allowing the same workload to measure the effect of PD separation.
+#
+# The swe-replay-v1 taskset reads job 188448 traces and replays trajectories
+# with estimated tool sleeps and recorded rewards. The orchestrator, trainer,
+# inference stack, and weight sync remain active.
+#
+# The environment-server virtual environment must contain:
+#   uv pip install -e experiments/rollout-simulation/swe_replay_v1
+#
+# The deterministic workload supports A/B comparisons of EP, all-to-all
+# backends, P:D ratios, and rollout concurrency.
+#
+# Submit:
+#   bash experiments/training/submit.sh swe_replay_colocated
+
+max_steps = 3
+seq_len = 65536
+
+[log]
+level = "debug"
+
+[model]
+name = "PrimeIntellect/INTELLECT-3"
+
+[weight_broadcast]
+type = "nccl"
+
+[deployment]
+type = "multi_node"
+num_train_nodes = 2
+
+[inference]
+enable_request_logs = true
+
+[inference.deployment]
+type = "multi_node"
+num_nodes = 2
+
+[inference.parallel]
+tp = 2
+
+[slurm]
+job_name = "swe-replay-colocated"
+partition = "batch"
+account = "coreai_horizon_dilations"
+time = "4:00:00"
+cleanup_grace_period = 300
+project_dir = "/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0"
+template_path = "/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0/experiments/training/templates/multi_node_rl_container.sbatch.j2"
+
+[ckpt]
+interval = 5
+
+[wandb]
+project = "prime-rl-swe"
+name = "swe-replay-colocated"
+
+[trainer.model]
+impl = "custom"
+attn = "flash_attention_2"
+ep = 8
+cp = 2
+fused_lm_head_token_chunk_size = 1024
+
+[trainer.model.compile]
+
+[trainer.model.ac_offloading]
+max_inflight_activations = 5
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "muon"
+lr = 1e-6
+weight_decay = 0.01
+
+[orchestrator]
+group_size = 16
+batch_size = 256
+oversampling_factor = 2
+max_off_policy_steps = 8
+eval = "None"
+
+[[orchestrator.pre_batch_filters]]
+type = "zero_advantage"
+enforce = true
+
+[[orchestrator.train.env]]
+name = "swe-replay"
+multiplex = 32
+# Source: non-error trajectories from job 188448, step 1.
+taskset = { id = "swe-replay-v1", source = "/lustre/fsw/portfolios/coreai/users/kfujii/src/prime-rl-v0.7.0/outputs/20260720-140939-swe_intellect3_disagg-validation/run_default/rollouts/step_1/train/all/traces.jsonl" }
+# Open mode keeps prompts deterministic; closed mode uses incremental bridging.
+harness = { id = "swe-replay-v1", mode = "open", tool_scale = 1.0, runtime = { type = "subprocess" } }
+
+[orchestrator.renderer]
+name = "prime-qwen3"

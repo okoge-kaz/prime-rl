@@ -1,0 +1,10 @@
+# Overlay limiting concurrent rollouts to 128. Inflight load is
+# oversampling_factor x batch_size, so 256 x 0.5 = 128.
+#
+#   bash experiments/training/submit.sh swe_replay_bench inflight128
+
+[orchestrator]
+oversampling_factor = 0.5
+
+[wandb]
+name = "swe-replay-bench-inflight128"

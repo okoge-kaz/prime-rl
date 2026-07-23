@@ -1,0 +1,25 @@
+# Stage 0 arm 4: EP8 + FlashInfer NVLink one-sided for intra-node B300 NVLink.
+#
+# Launch from a compute node inside the CUDA 13 container:
+#   uv run inference @ experiments/rollout-simulation/pd_sweep/stage0_flashinfer.toml
+
+gpu_memory_utilization = 0.9
+enable_expert_parallel = true
+all2all_backend = "flashinfer_nvlink_one_sided"
+enable_fp32_lm_head = true
+enable_fp32_router_logits = true
+
+[server]
+port = 8000
+
+[model]
+name = "PrimeIntellect/INTELLECT-3"
+tool_call_parser = "qwen3_coder"
+reasoning_parser = "deepseek_r1"
+
+[parallel]
+tp = 2
+dp = 4
+
+[log]
+level = "info"
