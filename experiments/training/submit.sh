@@ -1,24 +1,24 @@
 #!/bin/bash
-# RL 学習ジョブの投入 (login node で実行 OK — config 解決と sbatch 投入のみで重い処理はしない)
+# Submit an RL training job. This is safe on a login node.
 #
-# 使い方:
+# Usage:
 #   bash experiments/training/submit.sh math_qwen30b
 #   bash experiments/training/submit.sh swe_qwen30b
-#   bash experiments/training/submit.sh math_qwen30b --ckpt.resume-step -1   # 再開
+#   bash experiments/training/submit.sh math_qwen30b --ckpt.resume-step -1
 #
-# 流れ:
-#   1. `rl --dry-run` が rl.toml を trainer/orchestrator/inference の subconfig に分割し、
-#      コンテナ対応テンプレート (templates/multi_node_rl_container.sbatch.j2) から
-#      <output_dir>/rl.sbatch を生成する
-#   2. sbatch で投入 (実行はすべて compute node 上の pyxis コンテナ内)
+# A named variant overlays a TOML file in the run directory on rl.toml:
+#   bash experiments/training/submit.sh swe_intellect3_disagg validation
+#   bash experiments/training/submit.sh swe_intellect3_disagg long
 #
-# 前提:
-#   - .env にキー設定済み (WANDB / HF / PRIME)
-#   - モデルとデータセットは experiments/dataset/ のスクリプトで事前ダウンロード済み
-#     (dry-run はモデルの pre-download をスキップするため、未ダウンロードだと
-#     ジョブ側の初回ロードで HF から落とそうとする)
+# `rl --dry-run` resolves component configs and renders <output_dir>/rl.sbatch
+# from templates/multi_node_rl_container.sbatch.j2. sbatch then runs every
+# component in Pyxis containers on compute nodes.
+#
+# Prerequisites:
+#   - WANDB, HF, and PRIME credentials are configured in .env.
+#   - Models and datasets have been downloaded with experiments/dataset scripts.
 #   - sqsh: /lustre/fsw/portfolios/coreai/users/kfujii/containers/prime-rl-v0.7.0-cu13-disagg-v4.sqsh
-#     (template のデフォルト。PRIME_RL_SQSH 環境変数で差し替え可能)
+#     PRIME_RL_SQSH may override this template default.
 
 set -euo pipefail
 
@@ -26,31 +26,38 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CKPT_BASE="/lustre/fsw/portfolios/coreai/users/kfujii/checkpoints"
 
-RUN_NAME="${1:?usage: submit.sh <run_name: math_qwen30b|swe_qwen30b> [extra rl CLI args...]}"
+RUN_NAME="${1:?usage: submit.sh <run_name> [variant] [extra rl CLI args...]}"
 shift
 CONFIG="${SCRIPT_DIR}/${RUN_NAME}/rl.toml"
 [ -f "${CONFIG}" ] || { echo "config not found: ${CONFIG}" >&2; exit 1; }
 
-# PATH に uv が無いシェルから呼ばれても動くようにフォールバック解決する
+# Treat a second argument matching a TOML file as a configuration overlay.
+VARIANT=""
+CONFIG_ARGS=(@ "${CONFIG}")
+if [ $# -gt 0 ] && [ -f "${SCRIPT_DIR}/${RUN_NAME}/$1.toml" ]; then
+    VARIANT="$1"
+    shift
+    CONFIG_ARGS+=(@ "${SCRIPT_DIR}/${RUN_NAME}/${VARIANT}.toml")
+fi
+
+# Resolve uv from PATH or its standard per-user installation path.
 UV_BIN="$(command -v uv || true)"
 [ -n "${UV_BIN}" ] || UV_BIN="${HOME}/.local/bin/uv"
-[ -x "${UV_BIN}" ] || { echo "uv not found (PATH にも ${HOME}/.local/bin/uv にも無い)" >&2; exit 1; }
+[ -x "${UV_BIN}" ] || { echo "uv not found in PATH or ${HOME}/.local/bin/uv" >&2; exit 1; }
 
-# logs / configs / rollouts / job_%j.log は repo の outputs/ 配下に出す (進捗確認用)。
-# compute node からは repo が /lustre/... で見えるため、パスを変換して渡す。
-# 大きい checkpoint だけ --ckpt.output-dir で CKPT_BASE に分離する
-# (run_name 単位で固定なので、再投入しても --ckpt.resume-step -1 で継続できる)。
+# Keep logs, configs, rollouts, and job logs under the repository outputs
+# directory. Compute nodes see the repository under /lustre, so paths are
+# translated before submission. Large checkpoints use a separate CKPT_BASE
+# path that remains stable across submissions for resume-step -1.
 #
-# サブミットごとに outputs/<日付>-<run_name>/ を切る (フラットな 1 階層)。
-# job ID は sbatch が受理して初めて決まる (config にはパスを事前に焼き込む
-# 必要がある) ため、投入後に outputs/job-<job_id> -> <日付>-<run_name> の
-# symlink を張って job ID でも辿れるようにする。
+# Each submission gets outputs/<date>-<run_name>/. After sbatch assigns an ID,
+# outputs/job-<job_id> points to that directory.
 REPO_ROOT_LUSTRE="${REPO_ROOT/#\/scratch\/fsw/\/lustre\/fsw}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 OUT_BASE="${REPO_ROOT_LUSTRE}/outputs"
-RUN_DIR_NAME="${RUN_ID}-${RUN_NAME}"
+RUN_DIR_NAME="${RUN_ID}-${RUN_NAME}${VARIANT:+-${VARIANT}}"
 OUTPUT_DIR="${OUT_BASE}/${RUN_DIR_NAME}"
-CKPT_DIR="${CKPT_BASE}/${RUN_NAME}"
+CKPT_DIR="${CKPT_BASE}/${RUN_NAME}${VARIANT:+-${VARIANT}}"
 
 cd "${REPO_ROOT}"
 set -a
@@ -58,7 +65,7 @@ set -a
 source .env
 set +a
 
-"${UV_BIN}" run --no-sync rl @ "${CONFIG}" --output-dir "${OUTPUT_DIR}" --ckpt.output-dir "${CKPT_DIR}" --dry-run "$@"
+"${UV_BIN}" run --no-sync rl "${CONFIG_ARGS[@]}" --output-dir "${OUTPUT_DIR}" --ckpt.output-dir "${CKPT_DIR}" --dry-run "$@"
 
 JOB_ID=$(sbatch --parsable "${OUTPUT_DIR}/rl.sbatch")
 ln -sfn "${RUN_DIR_NAME}" "${OUT_BASE}/job-${JOB_ID}"

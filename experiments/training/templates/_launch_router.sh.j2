@@ -1,6 +1,6 @@
-{# src/prime_rl/templates/_launch_router.sh.j2 のコンテナ対応版。
-   vllm-router のみサポート (llm-d は third_party バイナリが必要なため未対応)。
-   vllm-router は image の /app/.venv/bin にインストール済み。 #}
+{# Container variant of src/prime_rl/templates/_launch_router.sh.j2.
+   Only vllm-router is supported because llm-d needs third-party binaries.
+   vllm-router is installed in /app/.venv/bin. #}
 # launch_router <mode:pd|regular> <worker_args> <port> <policy> <log> <replica_idx> <node_base> [node_count]
 launch_router() {
     local mode="$1" worker_args="$2" port="$3" policy="$4" log="$5" replica="${6:-0}" node_base="${7:-0}" node_count="${8:-0}"
@@ -10,9 +10,19 @@ launch_router() {
 {%- else %}
     local tag="vllm-router"; [ "$mode" = pd ] && tag="vllm-router (PD)"
     echo "Starting $tag on $LOCAL_IP:$port${replica:+ for replica $replica}" | tee "$log"
+    {# Keep this untrimmed comment outside the continued bash array. Trimmed
+        Jinja tags can remove newlines and concatenate adjacent arguments.
+        Avoid spelling a Jinja closing delimiter inside this comment.
+
+        Keep log level at info: debug logs token arrays for every proxied
+        request and creates enough I/O to perturb workload measurements.
+
+        Transparent retries absorb transient decode connection closures under
+        high concurrency before they surface as harness-level 504s. #}
     local -a cmd=(vllm-router --policy "$policy" --host 0.0.0.0 --port "$port"
         --request-id-headers x-session-id
-        --worker-startup-timeout-secs 4200 --log-level debug)
+        --worker-startup-timeout-secs 4200 --log-level info
+        --retry-max-retries 3 --retry-initial-backoff-ms 100 --retry-max-backoff-ms 2000)
     if [ "$mode" = pd ]; then
         cmd+=(--vllm-pd-disaggregation $worker_args)
     else

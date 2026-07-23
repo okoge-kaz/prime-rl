@@ -1,21 +1,16 @@
 #!/bin/bash
 {#
-  src/prime_rl/templates/multi_node_rl.sbatch.j2 のコンテナ (pyxis/enroot) 対応版。
-  rl.toml の [slurm].template_path でこのファイルを指すと、`rl` ランチャーが
-  config 分割・変数計算をした上でこのテンプレートを render する。
+  Pyxis/Enroot variant of src/prime_rl/templates/multi_node_rl.sbatch.j2.
+  The `rl` launcher resolves component configs and renders this template.
 
-  オリジナルとの差分:
-    - 各ノードの実行を pyxis コンテナ (prime-rl-v0.7.0-disagg.sqsh) 内で行う
-    - host 側の uv sync / .venv activate を削除 (依存は image に焼き込み済み)
-    - `uv run <cmd>` -> venv の console script 直接実行 (/app/.venv/bin が PATH)
-    - repo の src/packages/deps を /app に overlay mount し、image を rebuild
-      せずに現在の checkout のコードで実行する (/app/.venv の editable install が
-      /app/src 等を指しているため)
-    - IB 検出を ibv_devinfo (image に無い) から sysfs ベースに変更
-    - disagg 用 UCX パスを third_party/ucx から image 同梱の /opt/ucx に変更
-    - cluster 固有ディレクティブ (qos/chdir/signal/comment) を追加
-    - compute node からは repo が /lustre/... で見えるため、login node で
-      /scratch/... に resolve されたパスを /lustre/... に置換する
+  Differences from the upstream template:
+    - Run each node in the configured sqsh image.
+    - Use image-installed console scripts instead of host uv and .venv.
+    - Overlay src, packages, and deps from the checkout onto /app.
+    - Detect network interfaces through sysfs.
+    - Use the image's /opt/ucx for disaggregated inference.
+    - Add cluster QoS, chdir, signal, and idle-reaper directives.
+    - Translate login-node /scratch paths to compute-node /lustre paths.
 #}
 #SBATCH --job-name={{ job_name }}
 #SBATCH --nodes={{ num_train_nodes + num_infer_nodes }}
@@ -37,14 +32,22 @@
 #SBATCH --exclusive
 #SBATCH --output={{ output_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}/job_%j.log
 #SBATCH --error={{ output_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}/job_%j.log
-# --- cluster 固有の必須ディレクティブ ---
-# qos=short: 2h 以内の batch job に必要
+# Derive QoS from node count and wall time.
+# interactive: at most four nodes; short: at most two hours; normal: otherwise.
+{%- set _total_nodes = num_train_nodes + num_infer_nodes %}
+{%- set _req_hours = 999 if '-' in (time or '') else ((time or '0:00:00').split(':')[0] | int) %}
+{%- if _total_nodes <= 4 %}
+#SBATCH --qos=interactive
+{%- elif _req_hours <= 2 %}
 #SBATCH --qos=short
-# compute node 側の mount 位置 (/lustre/...) を作業ディレクトリに指定
+{%- else %}
+#SBATCH --qos=normal
+{%- endif %}
+# Use the compute-node /lustre mount as the working directory.
 #SBATCH --chdir={{ project_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}
-# teardown 用に batch script へ TERM を wall-time 120s 前に送る
+# Send TERM to the batch script 120 seconds before wall time for teardown.
 #SBATCH --signal=B:TERM@120
-# GPU idle reaper 対策: rollout (LLM decode) 中は DCGM SM_ACTIVE が低く idle 扱いされるため exempt を申請
+# Exempt long low-SM rollout phases from the occupied-idle GPU reaper.
 #SBATCH --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"120","reason":"benchmarking","description":"RL workload benchmark (2h wall time): rollout (LLM decode) phases run small-batch MoE decode with near-zero DCGM SM_ACTIVE for most of the job; observed ~35 min low-SM window per training step"}}'
 
 # Exit immediately on any failed command so a crash anywhere releases the
@@ -80,7 +83,7 @@ export INFERENCE_ENABLE_EXPERT_PARALLEL={{ "1" if inference_enable_expert_parall
 {%- endif %}
 {%- endif %}
 
-# Paths (compute node では /scratch mount が無いため /lustre 側のパスを使う)
+# Compute nodes use /lustre because /scratch is not mounted.
 export PROJECT_DIR={{ project_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}
 export CONFIG_DIR={{ config_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}
 export OUTPUT_DIR={{ output_dir | replace('/scratch/fsw/', '/lustre/fsw/') }}
@@ -91,14 +94,15 @@ ln -sfn trainer/node_0.log $OUTPUT_DIR/logs/trainer.log
 ln -sfn inference/node_0.log $OUTPUT_DIR/logs/inference.log
 
 # Container (pyxis/enroot)
-# PRIME_RL_SQSH で差し替え可能 (sbatch はデフォルトで submit 時の環境を export するため、
-# `PRIME_RL_SQSH=... bash experiments/training/submit.sh ...` で新イメージを試せる)
+# PRIME_RL_SQSH overrides the default because sbatch exports submit-time variables.
 export SQSH="${PRIME_RL_SQSH:-/lustre/fsw/portfolios/coreai/users/kfujii/containers/prime-rl-v0.7.0-cu13-disagg-v4.sqsh}"
-# FlashInfer の JIT キャッシュ (/root/.cache/flashinfer) はコンテナ内だと
-# ジョブごとに消え、毎回 compute_103a 向けカーネルの再コンパイル (10 分超) を
-# 払うことになるため、lustre 上の永続ディレクトリをマウントする。
+# Persist the FlashInfer JIT cache on Lustre across ephemeral containers.
 FLASHINFER_CACHE=/lustre/fsw/portfolios/coreai/users/kfujii/cache/flashinfer
 mkdir -p "$FLASHINFER_CACHE"
+# Persist vLLM torch.compile and uv caches on Lustre as well.
+export VLLM_CACHE_ROOT=/lustre/fsw/portfolios/coreai/users/kfujii/cache/vllm
+export UV_CACHE_DIR=/lustre/fsw/portfolios/coreai/users/kfujii/cache/uv
+mkdir -p "$VLLM_CACHE_ROOT" "$UV_CACHE_DIR"
 export CONTAINER_MOUNTS="/lustre/fsw/portfolios/coreai/users/kfujii:/lustre/fsw/portfolios/coreai/users/kfujii,${PROJECT_DIR}:${PROJECT_DIR},${PROJECT_DIR}/src:/app/src,${PROJECT_DIR}/packages:/app/packages,${PROJECT_DIR}/deps:/app/deps,${FLASHINFER_CACHE}:/root/.cache/flashinfer"
 
 export WANDB_SHARED_MODE=1
@@ -177,9 +181,7 @@ export MASTER_PORT=29500
 echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
 
-# Setup environment (host 側)
-# コンテナ運用のため uv sync / venv activate はしない。.env は `set -a` で export し、
-# srun -> pyxis 経由でコンテナ内のプロセスにも伝播させる。
+# Host-side setup. Export .env so srun and Pyxis propagate it into containers.
 cd $PROJECT_DIR
 set -a
 [ -f .env ] && source .env
@@ -193,7 +195,7 @@ set +a
 # Cleanup stale node-local state from prior jobs. Orphan python/torchrun/vllm
 # processes and vLLM/torch IPC files under /dev/shm and /tmp can survive SLURM
 # termination and cause the next launch to hang. Harmless on clean nodes.
-# (host 側で実行 — コンテナ不要)
+# Run on the host; no container is needed.
 srun bash -s <<'CLEANUP_SH'
     pkill -9 -f "[p]ython.*prime_rl" 2>/dev/null
     pkill -9 -f "[t]orchrun" 2>/dev/null
@@ -209,7 +211,16 @@ srun bash -s <<'CLEANUP_SH'
     echo "[node-cleanup] $(hostname) procs=$procs gpu_mem=${gpu}MiB"
 CLEANUP_SH
 
-# Run RL (各タスク = 1 ノード = 1 pyxis コンテナ)
+# Host-side release watcher. The orchestrator writes JOB_DONE from its
+# container, and this watcher uses scancel because vLLM does not exit itself.
+(
+    while [ ! -f "$OUTPUT_DIR/JOB_DONE" ]; do sleep 20; done
+    echo "[job-done-watcher] JOB_DONE detected - releasing allocation with scancel"
+    scancel $SLURM_JOB_ID
+) &
+JOB_DONE_WATCHER_PID=$!
+
+# Run RL with one Pyxis container per Slurm task and node.
 # --kill-on-bad-exit=1 propagates a non-zero exit on any node to all other
 # tasks so a crashed component terminates the SLURM job instead of leaving the
 # surviving ranks holding nodes.
@@ -222,7 +233,7 @@ srun --kill-on-bad-exit=1 \
     # process crashes (router, orchestrator) as task failures.
     set -o pipefail
 
-    # Source environment (コンテナ内: venv は /app/.venv 固定)
+    # Source the environment; the container virtual environment is /app/.venv.
     cd $PROJECT_DIR
     set -a
     [ -f .env ] && source .env
@@ -233,22 +244,15 @@ srun --kill-on-bad-exit=1 \
     # Higher ulimit
     ulimit -n 65536
 
-    # ノード間 NCCL の設定。この cluster は AWS 上にあり、ノード間 RDMA は
-    # EFA (rdmap* × 16, driver=efa)。EFA を NCCL から使うには aws-ofi-nccl
-    # プラグイン (libnccl-net.so) が必要。プラグイン無しだと NCCL は
-    # link_layer=InfiniBand に見える ibp198s0f0/ibp199s0f0 (別系統でノード間
-    # 疎通なし) を IB transport で選び、IBV_WC_RETRY_EXC_ERR / async fatal
-    # event で hang する (pool0-0129/0125/0229/0282/0430 の全組み合わせで再現)。
+# Inter-node RDMA uses AWS EFA and requires the aws-ofi-nccl plugin. Without
+# the plugin, NCCL may select unrelated InfiniBand-looking interfaces that
+# cannot communicate across nodes.
     #
-    # image に aws-ofi-nccl があれば LD_LIBRARY_PATH 経由で NCCL に自動ロード
-    # させて EFA を使う (AWS 公式手順どおり FI_PROVIDER は設定しない。成功時は
-    # NCCL_DEBUG=INFO で "NET/OFI Selected Provider is efa" が出る)。
-    # 無い旧 image では IB transport を無効化して TCP ソケットにフォールバック。
+# Load aws-ofi-nccl when present, without setting FI_PROVIDER. Older images
+# disable IB transport and fall back to TCP sockets.
     if [ -d /opt/amazon/ofi-nccl/lib ]; then
         export LD_LIBRARY_PATH=/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH:-}
-        # EFA installer 1.49 が入れる plugin は libnccl-net-ofi.so (デフォルトの
-        # 探索名 libnccl-net.so と異なる)。suffix を明示しないとロードされず
-        # IB transport に落ちて hang が再発する。
+        # EFA installer 1.49 uses libnccl-net-ofi.so, so select its suffix.
         export NCCL_NET_PLUGIN=ofi
         export NCCL_TUNER_PLUGIN=ofi
     else
@@ -286,16 +290,13 @@ if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
     # Bind gloo to the interface that owns LOCAL_IP (the rendezvous IP).
     GLOO_IFNAME=$(ip -o -4 addr show to "$LOCAL_IP" 2>/dev/null | awk "{print \$2; exit}")
     if [ -n "$GLOO_IFNAME" ]; then export GLOO_SOCKET_IFNAME=$GLOO_IFNAME; fi
-    # UCX/NIXL の KV transfer は TCP (ENA, LOCAL_IP を持つ IF) に固定する。
-    # この cluster に RDMA の自動選択は使えない:
-    #   - mlx5 デバイスは存在しない (EFA cluster)
-    #   - link_layer=InfiniBand に見える ibp19{8,9}s0f0 はノード間疎通の無い別系統
-    #     (選ぶと転送時に hang。NCCL と同じ罠, job 173854)
-    #   - EFA (rdmap*) は UCX の verbs 経路では未検証。EFA ネイティブ化は
-    #     NIXL libfabric backend の検証後に行う
+# Pin UCX/NIXL KV transfer to TCP over the ENA interface carrying LOCAL_IP.
+# Automatic RDMA selection is unsafe on this EFA cluster: there are no mlx5
+# devices, and the InfiniBand-looking interfaces do not communicate across
+# nodes. Native EFA transfer uses the NIXL libfabric backend.
     export UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc
     export UCX_NET_DEVICES=${GLOO_IFNAME:-all}
-    # image 同梱の UCX 1.19 (nixl はこれに対して build 済み)
+    # NIXL is built against the image's UCX 1.19.
     export LD_LIBRARY_PATH="/opt/ucx/lib:/opt/ucx/lib/ucx:${LD_LIBRARY_PATH:-}"
     export VLLM_NIXL_SIDE_CHANNEL_HOST=$LOCAL_IP
     export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
@@ -419,12 +420,39 @@ if [ "$SLURM_PROCID" -eq "$ORCH_PROCID" ]; then
     {% if use_nccl_broadcast %}ORCHESTRATOR_ARGS="$ORCHESTRATOR_ARGS --weight_broadcast.host $MASTER_ADDR"
     {% endif %}WANDB_SHARED_LABEL=orchestrator orchestrator $ORCHESTRATOR_ARGS \
         2>&1 | tee $OUTPUT_DIR/logs/orchestrator.log | sed -u "s/\x1b\[[0-9;]*m//g;s/^/[orch] /" &
+    ORCH_PID=$!
 fi
 {% endif %}
 
 # Wait for the first background job to exit and propagate its exit code.
 wait -n
 EXIT_CODE=$?
+{% if num_infer_nodes > 0 %}
+# On a clean exit, wait for all finite components colocated on the trainer node
+# before teardown. This prevents final evaluation or checkpoint writes from
+# being killed when trainer and orchestrator finish in either order. Non-zero
+# exits still trigger immediate distributed teardown.
+{% if not orchestrator_on_inference %}
+if [ "$EXIT_CODE" -eq 0 ] && [ "$SLURM_PROCID" -eq "$ORCH_PROCID" ]; then
+    while [ -n "$(jobs -p)" ]; do
+        # This block is inside a single-quoted bash command. Do not use single
+        # quotes here, including in comments.
+        echo "[$(hostname)] clean component exit - waiting for remaining components ($(jobs -p | xargs))"
+        wait -n
+        code=$?
+        [ "$code" -ne 0 ] && EXIT_CODE=$code
+    done
+fi
+{% else %}
+# When the orchestrator shares an inference node, wait only for the
+# orchestrator because vLLM does not exit itself.
+if [ "$EXIT_CODE" -eq 0 ] && [ "$SLURM_PROCID" -eq "$ORCH_PROCID" ] \
+    && [ -n "${ORCH_PID:-}" ] && kill -0 $ORCH_PID 2>/dev/null; then
+    wait $ORCH_PID
+    EXIT_CODE=$?
+fi
+{% endif %}
+{% endif %}
 REMAINING_PIDS=$(jobs -p)
 {%- if cleanup_grace_period %}
 # On a non-zero exit stay alive for the grace period so in-flight trainer
@@ -438,5 +466,15 @@ echo "[$(hostname)] tearing down (exit code $EXIT_CODE) - terminating remaining 
 for pid in $REMAINING_PIDS; do
     kill -TERM $pid 2>/dev/null || true
 done
+{% if num_infer_nodes > 0 %}
+# vLLM does not exit itself, so the orchestrator writes a sentinel for the
+# host-side scancel watcher.
+if [ "$SLURM_PROCID" -eq "$ORCH_PROCID" ]; then
+    touch $OUTPUT_DIR/JOB_DONE
+fi
+{% endif %}
 exit $EXIT_CODE
 '
+SRUN_EXIT=$?
+kill $JOB_DONE_WATCHER_PID 2>/dev/null || true
+exit $SRUN_EXIT
