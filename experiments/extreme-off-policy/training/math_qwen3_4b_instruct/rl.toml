@@ -1,0 +1,89 @@
+# Extreme off-policy Phase 1 checkpoint producer:
+# Qwen3-4B-Instruct-2507 math RL with one training and two inference nodes.
+# Save HF-compatible weight and resumable full checkpoints every step. Keep
+# temperature and top_p at 1.0 so q is the untruncated softmax probability.
+#
+#   Validate: bash experiments/training/submit.sh math_qwen3_4b_instruct validation
+#   Run:      bash experiments/training/submit.sh math_qwen3_4b_instruct
+
+max_steps = 50
+seq_len = 24576
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[weight_broadcast]
+type = "nccl"
+
+[deployment]
+type = "multi_node"
+num_train_nodes = 1
+num_infer_nodes = 2
+
+[slurm]
+job_name = "math-qwen3-4b-instruct"
+partition = "batch"
+account = "coreai_horizon_dilations"
+# Batch-partition wall-time limit.
+time = "04:00:00"
+project_dir = "/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0"
+template_path = "/scratch/fsw/portfolios/coreai/projects/coreai_horizon_dilations/users/kfujii/src/prime-rl-v0.7.0/experiments/training/templates/multi_node_rl_container.sbatch.j2"
+
+[ckpt]
+interval = 1
+
+# Retain every full and weight checkpoint, then prune full checkpoints after
+# the run. Resume with --ckpt.resume-step -1.
+
+[wandb]
+project = "extreme-off-policy"
+name = "math-qwen3-4b-instruct"
+
+[trainer.model]
+# FA3 binaries target Hopper; use FlashAttention 2 on B300.
+attn = "flash_attention_2"
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[orchestrator]
+# batch_size counts rollouts: 1024 = 64 groups x 16.
+batch_size = 1024
+group_size = 16
+max_off_policy_steps = 2
+# Inflight rollouts = batch x oversampling = 2048.
+oversampling_factor = 2
+
+[orchestrator.train.sampling]
+# Use the model-card output length without artificial truncation.
+max_completion_tokens = 16384
+
+[[orchestrator.train.env]]
+name = "i3-math"
+# Exclude avg@8=0 tasks that would create all-zero groups.
+taskset = { id = "i3-math-v1", filter = { column = "avg@8_qwen3_4b_instruct_2507", min = 0.125, max = 0.625 } }
+harness = { id = "null", runtime = { type = "subprocess" } }
+
+[orchestrator.eval]
+interval = 10
+
+[orchestrator.eval.sampling]
+max_completion_tokens = 16384
+
+# Use group size eight for the 30-problem evaluation set.
+[[orchestrator.eval.env]]
+name = "aime25"
+taskset = { id = "aime25-v1" }
+group_size = 8
+
+# Set the serving limit explicitly; seq_len does not propagate automatically.
+[inference.model]
+max_model_len = 24576
+
+[inference.parallel]
+# The dense 4B model uses eight-way data parallelism without TP.
+tp = 1

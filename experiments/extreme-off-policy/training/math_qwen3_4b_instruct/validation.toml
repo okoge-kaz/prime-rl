@@ -1,0 +1,18 @@
+# Interactive validation overlay for rl.toml.
+#
+#   bash experiments/training/submit.sh math_qwen3_4b_instruct validation
+#
+# Check task/reward distribution, per-step HF-compatible weight checkpoints,
+# and rollout prompt token IDs for Phase 2 parity.
+
+max_steps = 3
+
+[orchestrator]
+batch_size = 32
+
+# Exercise the evaluation path once at step two.
+[orchestrator.eval]
+interval = 2
+
+[wandb]
+name = "math-qwen3-4b-instruct-val"
